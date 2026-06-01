@@ -1,6 +1,8 @@
 Dexed - FM Plugin Synth
 =======================
 
+> **Note:** This is **not** the original Dexed. This repository is a customized fork of [Dexed](https://github.com/asb2m10/dexed) modified for use with [Real2Dex](https://github.com/real2dex). It may differ from the upstream project in behavior, features, and compatibility.
+
 Please see [Dexed User Website](https://asb2m10.github.io/dexed) for user and download information.
 
 Dexed is a multi-platform, multi format plugin synth that is closely modeled on the Yamaha DX7.
