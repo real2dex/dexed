@@ -20,3 +20,6 @@ build*/
 .idea
 cmake-build-*
 ignore/
+
+# Python
+.venv/

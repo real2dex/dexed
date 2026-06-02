@@ -1,0 +1,1 @@
+Start-Process -FilePath ".\build\Source\Dexed_artefacts\Release\Standalone\Dexed.exe"

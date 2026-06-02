@@ -118,9 +118,16 @@ DexedAudioProcessor::DexedAudioProcessor()
     
     mtsClient = NULL;
     mtsClient = MTS_RegisterClient();
+
+    // Start JSON parameter server for external control
+    jsonServer = std::make_unique<JsonServer>(*this);
+    jsonServer->startThread();
 }
 
 DexedAudioProcessor::~DexedAudioProcessor() {
+    // Shut down JSON server before other members are destroyed
+    jsonServer.reset();
+
     Logger *tmp = Logger::getCurrentLogger();
 	if ( tmp != NULL ) {
 		Logger::setCurrentLogger(NULL);
@@ -197,6 +204,13 @@ void DexedAudioProcessor::releaseResources() {
 }
 
 void DexedAudioProcessor::processBlock(AudioSampleBuffer& buffer, MidiBuffer& midiMessages) {
+
+    // Yield silently to the offline rendering thread when it holds renderLock
+    juce::GenericScopedTryLock<juce::CriticalSection> renderGuard(renderLock);
+    if (!renderGuard.isLocked()) {
+        buffer.clear();
+        return;
+    }
 
     juce::ScopedNoDenormals noDenormals;
 
@@ -875,6 +889,89 @@ AudioProcessorEditor* DexedAudioProcessor::createEditor() {
 
 void DexedAudioProcessor::setZoomFactor(float factor) {
     zoomFactor = factor;
+}
+
+// Offline audio clip renderer: 120 BPM, 4 beats sound + 4 beats tail, 48kHz/32bit/mono WAV
+void DexedAudioProcessor::renderClipToFile(const juce::File& outputFile, int midiNote, float velocity)
+{
+    constexpr double RENDER_RATE  = 48000.0;
+    constexpr int    BLOCK_SIZE   = 512;
+    constexpr double BPM          = 120.0;
+    constexpr int    SOUND_BEATS  = 4;
+    constexpr int    TAIL_BEATS   = 4;
+
+    const double beatsPerSec  = BPM / 60.0;
+    const int soundSamples    = juce::roundToInt(SOUND_BEATS / beatsPerSec * RENDER_RATE); // 96000
+    const int tailSamples     = juce::roundToInt(TAIL_BEATS  / beatsPerSec * RENDER_RATE); // 96000
+    const int totalSamples    = soundSamples + tailSamples;                                // 192000
+
+    isRenderingClip = true;
+
+    const double origRate  = getSampleRate();
+    const int    origBlock = getBlockSize();
+
+    juce::AudioSampleBuffer renderBuf(1, BLOCK_SIZE);
+    juce::AudioSampleBuffer monoBuf(1, totalSamples);
+
+    {
+        juce::ScopedLock lock(renderLock); // audio thread returns silence while this is held
+
+        prepareToPlay(RENDER_RATE, BLOCK_SIZE);
+
+        bool noteOnSent  = false;
+        bool noteOffSent = false;
+        int  samplePos   = 0;
+
+        while (samplePos < totalSamples)
+        {
+            const int blockLen = juce::jmin(BLOCK_SIZE, totalSamples - samplePos);
+            renderBuf.setSize(1, blockLen, false, true, false);
+            renderBuf.clear();
+
+            juce::MidiBuffer midi;
+
+            if (!noteOnSent)
+            {
+                midi.addEvent(juce::MidiMessage::noteOn(1, midiNote,
+                    (uint8_t)juce::roundToInt(velocity * 127.0f)), 0);
+                noteOnSent = true;
+            }
+
+            if (!noteOffSent && samplePos + blockLen > soundSamples)
+            {
+                midi.addEvent(juce::MidiMessage::noteOff(1, midiNote),
+                    juce::jmax(0, soundSamples - samplePos));
+                noteOffSent = true;
+            }
+
+            processBlock(renderBuf, midi); // reentrant: same thread already owns renderLock
+
+            juce::FloatVectorOperations::copy(
+                monoBuf.getWritePointer(0, samplePos),
+                renderBuf.getReadPointer(0),
+                blockLen);
+
+            samplePos += blockLen;
+        }
+
+        prepareToPlay(origRate > 0.0 ? origRate : 44100.0,
+                      origBlock > 0  ? origBlock : 512);
+    }
+
+    isRenderingClip = false;
+
+    // Write 48 kHz / 32-bit float / mono WAV
+    juce::WavAudioFormat wavFormat;
+    auto outStream = outputFile.createOutputStream();
+    if (!outStream) return;
+
+    auto* rawStream = outStream.get();
+    auto writer = std::unique_ptr<juce::AudioFormatWriter>(
+        wavFormat.createWriterFor(rawStream, RENDER_RATE, 1, 32, {}, 0));
+    if (!writer) return;
+
+    outStream.release(); // writer owns the stream now
+    writer->writeFromAudioSampleBuffer(monoBuf, 0, totalSamples);
 }
 
 void DexedAudioProcessor::handleAsyncUpdate() {

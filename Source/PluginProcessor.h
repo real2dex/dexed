@@ -37,6 +37,7 @@
 #include "SysexComm.h"
 #include "EngineMkI.h"
 #include "EngineOpl.h"
+#include "JsonServer.h"
 
 struct ProcessorVoice {
     int channel;
@@ -283,8 +284,14 @@ public :
     void setZoomFactor(float factor);
     float getZoomFactor() {
         return zoomFactor;
-    }    
+    }
+
+    std::unique_ptr<JsonServer> jsonServer;
+    void renderClipToFile(const juce::File& outputFile, int midiNote = 69, float velocity = 0.8f);
+    std::atomic<bool> isRenderingClip { false };
+
 private:
+    juce::CriticalSection renderLock;
     int chooseNote(uint8_t pitch);
     int32_t nextKeydownSeq;;
     //==============================================================================

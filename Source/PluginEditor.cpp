@@ -79,12 +79,27 @@ DexedAudioProcessorEditor::DexedAudioProcessorEditor (DexedAudioProcessor* owner
 
     // The DX7 is a badass on the bass, keep it that way
     midiKeyboard.setLowestVisibleKey(24);
-    midiKeyboard.setBounds(4, 581, getWidth() - 8, 90);
+    midiKeyboard.setBounds(4, 581 + STATUS_BAR_H, WINDOW_SIZE_X - 8, 90);
     midiKeyboard.setTitle("Keyboard keys");
 
     frameComponent.addAndMakeVisible(&global);
     global.setBounds(2,436,864,144);
     global.bind(this);
+
+    // Status bar: JSON server info + zoom controls
+    serverStatusBar.setServer(processor->jsonServer.get());
+    serverStatusBar.setProcessor(processor);
+    serverStatusBar.setZoomCallbacks(
+        [this]() { return processor->getZoomFactor(); },
+        [this](float z) {
+            processor->setZoomFactor(z);
+            processor->savePreference();
+            frameComponent.setTransform(AffineTransform::scale(z));
+            resetSize();
+        }
+    );
+    frameComponent.addAndMakeVisible(&serverStatusBar);
+    serverStatusBar.setBounds(0, 580, WINDOW_SIZE_X, STATUS_BAR_H);
 
     global.setMonoState(processor->isMonoMode());
 
@@ -264,6 +279,8 @@ void DexedAudioProcessorEditor::timerCallback() {
         processor->forceRefreshUI = false;
         updateUI();
     }
+
+    serverStatusBar.repaint(); // Refresh server status bar every timer tick
 
     if ( ! processor->peekVoiceStatus() )
         return;
@@ -605,6 +622,12 @@ bool DexedAudioProcessorEditor::keyPressed(const KeyPress& key, Component* origi
 
     if ( key.getKeyCode() == KeyPress::escapeKey ) {
         cartManager.hideCartridgeManager();
+        return true;
+    }
+
+    // F5 — reset zoom to 100%
+    if ( key.getKeyCode() == KeyPress::F5Key ) {
+        resetZoomFactor();
         return true;
     }
 

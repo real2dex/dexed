@@ -28,7 +28,7 @@ juce_add_plugin("${BaseTargetName}"
         PRODUCT_NAME "Dexed"
         DESCRIPTION "Dexed FM Synth"
         BUNDLE_ID "com.digitalsuburban.Dexed"  # To avoid CMake Warning at libs/JUCE/extras/Build/CMake/JUCEUtils.cmake
-        COPY_PLUGIN_AFTER_BUILD TRUE
+        COPY_PLUGIN_AFTER_BUILD FALSE
 )
 
 clap_juce_extensions_plugin(TARGET ${BaseTargetName}
@@ -42,6 +42,7 @@ include_directories(../libs/MTS-ESP/Client)
 target_sources(${BaseTargetName} PRIVATE
 	AlgoDisplay.cpp
 	CartManager.cpp
+    JsonServer.cpp
 	DXComponents.cpp
 	DXLookNFeel.cpp
 	EngineMkI.cpp
