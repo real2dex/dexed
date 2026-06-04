@@ -149,10 +149,18 @@ void JsonServer::handleClient(juce::StreamingSocket& client)
             //            {"output": "/out/003.wav", "load_syx": "/path.syx", "program": 3}
             if (obj->hasProperty("batch"))       { handleBatch(client, json);      continue; }
 
+            // Apply params on the message thread and wait for CtrlUpdate
+            // callAsync messages (queued by setParameter) to finish too.
+            auto done = std::make_shared<juce::WaitableEvent>();
             juce::var captured = json;
-            juce::MessageManager::callAsync([this, captured]() {
+            juce::MessageManager::callAsync([this, captured, done]() mutable {
                 applyJson(captured);
+                juce::MessageManager::callAsync([done]() mutable {
+                    done->signal();
+                });
             });
+            done->wait(5000);
+            sendJson(client, R"({"ok": true})");
         }
     }
 }
