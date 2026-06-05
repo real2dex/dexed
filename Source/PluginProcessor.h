@@ -290,8 +290,15 @@ public :
     void renderClipToFile(const juce::File& outputFile, int midiNote = 69, float velocity = 0.8f);
     std::atomic<bool> isRenderingClip { false };
 
+    void beginBatchRender();
+    void endBatchRender();
+    bool isBatchRenderActive() const { return batchRenderActive; }
+
 private:
     juce::CriticalSection renderLock;
+    bool   batchRenderActive { false };
+    double batchOrigRate     { 0.0 };
+    int    batchOrigBlock    { 0 };
     int chooseNote(uint8_t pitch);
     int32_t nextKeydownSeq;;
     //==============================================================================

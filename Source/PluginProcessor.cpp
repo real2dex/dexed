@@ -226,7 +226,8 @@ void DexedAudioProcessor::processBlock(AudioSampleBuffer& buffer, MidiBuffer& mi
         refreshVoice = false;
     }
 
-    keyboardState.processNextMidiBuffer(midiMessages, 0, numSamples, true);
+    if (!batchRenderActive)
+        keyboardState.processNextMidiBuffer(midiMessages, 0, numSamples, true);
     
     MidiBuffer::Iterator it(midiMessages);
     hasMidiMessage = it.getNextEvent(*nextMidi,midiEventPos);
@@ -914,14 +915,14 @@ void DexedAudioProcessor::renderClipToFile(const juce::File& outputFile, int mid
     juce::AudioSampleBuffer monoBuf(1, totalSamples);
 
     {
-        juce::ScopedLock lock(renderLock); // audio thread returns silence while this is held
+        juce::ScopedLock lock(renderLock); // re-entrant in batch mode; audio thread stays silent
 
-        prepareToPlay(RENDER_RATE, BLOCK_SIZE);
+        if (!batchRenderActive)
+            prepareToPlay(RENDER_RATE, BLOCK_SIZE);
 
         bool noteOnSent  = false;
         bool noteOffSent = false;
         int  samplePos   = 0;
-
         while (samplePos < totalSamples)
         {
             const int blockLen = juce::jmin(BLOCK_SIZE, totalSamples - samplePos);
@@ -954,8 +955,9 @@ void DexedAudioProcessor::renderClipToFile(const juce::File& outputFile, int mid
             samplePos += blockLen;
         }
 
-        prepareToPlay(origRate > 0.0 ? origRate : 44100.0,
-                      origBlock > 0  ? origBlock : 512);
+        if (!batchRenderActive)
+            prepareToPlay(origRate > 0.0 ? origRate : 44100.0,
+                          origBlock > 0  ? origBlock : 512);
     }
 
     isRenderingClip = false;
@@ -974,8 +976,26 @@ void DexedAudioProcessor::renderClipToFile(const juce::File& outputFile, int mid
     writer->writeFromAudioSampleBuffer(monoBuf, 0, totalSamples);
 }
 
+void DexedAudioProcessor::beginBatchRender()
+{
+    batchOrigRate  = getSampleRate();
+    batchOrigBlock = getBlockSize();
+    renderLock.enter();   // audio callback returns silence (TryLock fails) for entire batch
+    prepareToPlay(48000.0, 512);
+    batchRenderActive = true;
+}
+
+void DexedAudioProcessor::endBatchRender()
+{
+    batchRenderActive = false;
+    prepareToPlay(batchOrigRate  > 0.0 ? batchOrigRate  : 44100.0,
+                  batchOrigBlock > 0   ? batchOrigBlock : 512);
+    renderLock.exit();
+}
+
 void DexedAudioProcessor::handleAsyncUpdate() {
-    updateUI();
+    if (batchRenderActive)
+        return;
 }
 
 void dexed_trace(const char *source, const char *fmt, ...) {

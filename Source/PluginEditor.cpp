@@ -277,10 +277,14 @@ void DexedAudioProcessorEditor::comboBoxChanged (ComboBox* comboBoxThatHasChange
 void DexedAudioProcessorEditor::timerCallback() {
     if ( processor->forceRefreshUI ) {
         processor->forceRefreshUI = false;
-        updateUI();
+        if (!processor->isBatchRenderActive())
+            updateUI();
     }
 
     serverStatusBar.repaint(); // Refresh server status bar every timer tick
+
+    if (processor->isBatchRenderActive())
+        return;
 
     if ( ! processor->peekVoiceStatus() )
         return;

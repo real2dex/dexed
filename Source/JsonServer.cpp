@@ -122,8 +122,7 @@ void JsonServer::handleClient(juce::StreamingSocket& client)
             if (json.isVoid())
                 continue;
 
-            juce::ScopedLock lock(lastJsonLock);
-            lastJson = line;
+            { juce::ScopedLock lock(lastJsonLock); lastJson = line; }
 
             // Dispatch: synchronous handlers for query / load_syx
             juce::DynamicObject* obj = json.getDynamicObject();
@@ -155,9 +154,9 @@ void JsonServer::handleClient(juce::StreamingSocket& client)
             juce::var captured = json;
             juce::MessageManager::callAsync([this, captured, done]() mutable {
                 applyJson(captured);
-                juce::MessageManager::callAsync([done]() mutable {
-                    done->signal();
-                });
+                processor.forceRefreshUI = true;
+                processor.triggerAsyncUpdate();
+                done->signal();
             });
             done->wait(5000);
             sendJson(client, R"({"ok": true})");
@@ -285,6 +284,8 @@ void JsonServer::handleBatch(juce::StreamingSocket& client, const juce::var& jso
     int         succeeded = 0;
     juce::Array<juce::var> failures;
 
+    processor.beginBatchRender();
+
     for (int idx = 0; idx < total; ++idx)
     {
         juce::DynamicObject* itemObj = items[idx].getDynamicObject();
@@ -347,8 +348,6 @@ void JsonServer::handleBatch(juce::StreamingSocket& client, const juce::var& jso
                 }
             }
 
-            processor.forceRefreshUI = true;
-            processor.triggerAsyncUpdate();
             done->signal();
         });
         done->wait(5000);
@@ -374,11 +373,18 @@ void JsonServer::handleBatch(juce::StreamingSocket& client, const juce::var& jso
         }
     }
 
+    processor.endBatchRender();
+
+    juce::MessageManager::callAsync([this]() {
+        processor.forceRefreshUI = true;
+        processor.triggerAsyncUpdate();
+    });
+
     juce::DynamicObject::Ptr resp = new juce::DynamicObject();
-    resp->setProperty("batch_done", true);
-    resp->setProperty("total",      total);
-    resp->setProperty("succeeded",  succeeded);
-    resp->setProperty("failed",     (int)failures.size());
+    resp->setProperty("batch_done",      true);
+    resp->setProperty("total",           total);
+    resp->setProperty("succeeded",       succeeded);
+    resp->setProperty("failed",          (int)failures.size());
     if (!failures.isEmpty())
         resp->setProperty("failures", juce::var(failures));
     sendJson(client, juce::JSON::toString(juce::var(resp.get()), true));
