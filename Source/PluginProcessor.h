@@ -23,8 +23,6 @@
 
 #include "../JuceLibraryCode/JuceHeader.h"
 
-#include "clap-juce-extensions/clap-juce-extensions.h"
-
 #include "msfa/controllers.h"
 #include "msfa/dx7note.h"
 #include "msfa/lfo.h"
@@ -34,10 +32,9 @@
 #include "PluginParam.h"
 #include "PluginData.h"
 #include "PluginFx.h"
-#include "SysexComm.h"
 #include "EngineMkI.h"
 #include "EngineOpl.h"
-#include "JsonServer.h"
+#include "RenderSpec.h"
 
 struct ProcessorVoice {
     int channel;
@@ -68,7 +65,7 @@ const int MAX_SCL_KBM_FILE_SIZE = 16384;
 //==============================================================================
 /**
 */
-class DexedAudioProcessor  : public AudioProcessor, public AsyncUpdater, public MidiInputCallback, public clap_juce_extensions::clap_properties
+class DexedAudioProcessor  : public AudioProcessor
 {
     static const int MAX_ACTIVE_NOTES = 16;
     ProcessorVoice voices[MAX_ACTIVE_NOTES];
@@ -102,26 +99,26 @@ class DexedAudioProcessor  : public AudioProcessor, public AsyncUpdater, public 
      */
     bool refreshVoice;
     bool normalizeDxVelocity;
-    bool sendSysexChange;
-    
+
     void processMidiMessage(const MidiMessage *msg);
     void keydown(uint8_t chan, uint8_t pitch, uint8_t velo);
     void keyup(uint8_t, uint8_t pitch, uint8_t velo);
-    
-    /**
-     * this is called from the Audio thread to tell
-     * to update the UI / hostdata 
-     */
-    void handleAsyncUpdate() override;
+
     void initCtrl();
 
 	MidiMessage* nextMidi,*midiMsg;
 	bool hasMidiMessage;
     int midiEventPos;
 	bool getNextEvent(MidiBuffer::Iterator* iter,const int samplePos);
-    
-    void handleIncomingMidiMessage(MidiInput* source, const MidiMessage& message) override;
+
+    void handleIncomingMidiMessage(const MidiMessage& message);
     uint32_t engineType;
+
+    // Offline "the rest of this clip is silence" detection. See trackFmSilence().
+    bool     skipDeadVoices     = false;
+    bool     fmPermanentlySilent = false;
+    uint64_t silentChunkSamples = 0;
+    void trackFmSilence(const float* sumbuf);
     
     FmCore engineMsfa;
     EngineMkI engineMkI;
@@ -132,8 +129,6 @@ class DexedAudioProcessor  : public AudioProcessor, public AsyncUpdater, public 
     void unpackOpSwitch(char packOpValue);
     void packOpSwitch();
 
-    float zoomFactor = 1;
-
 public :
     // in MIDI units (0x4000 is neutral)
     Controllers controllers;
@@ -141,14 +136,9 @@ public :
     Cartridge currentCart;
     uint8_t data[161];
 
-    SysexComm sysexComm;
     VoiceStatus voiceStatus;
     File activeFileCartridge;
-    
-    bool forceRefreshUI;
-    float vuSignal;
-    double vuDecayFactor = 0.999361; // (for 48 kHz sampling rate)
-    bool showKeyboard;
+
     int getEngineType();
     void setEngineType(int rs);
     
@@ -193,19 +183,10 @@ public :
         return monoMode;
     }
     void setMonoMode(bool mode);
-    
-    void copyToClipboard(int srcOp);
-    void pasteOpFromClipboard(int destOp);
-    void pasteEnvFromClipboard(int destOp);
-    void sendCurrentSysexProgram();
-    void sendCurrentSysexCartridge();
-    void sendSysexCartridge(File cart);
-    
+
     //==============================================================================
-    AudioProcessorEditor* createEditor() override;
-    bool hasEditor() const override;
-    void updateUI();
-    bool peekVoiceStatus();
+    AudioProcessorEditor* createEditor() override { return nullptr; }
+    bool hasEditor() const override { return false; }
     int updateProgramFromSysex(const uint8 *rawdata);
     void setupStartupCart();
     
@@ -241,18 +222,9 @@ public :
     void getStateInformation (MemoryBlock& destData) override;
     void setStateInformation (const void* data, int sizeInBytes) override;
     
-    // this is kept up to date with the midi messages that arrive, and the UI component
-    // registers with it so it can represent the incoming messages
-    MidiKeyboardState keyboardState;
-    void unbindUI();
-
-    void loadPreference();
-    void savePreference();
-    
     static File dexedAppDir;
     static File dexedCartDir;
 
-    Value lastCCUsed;
     int lastActiveVoice = 0;
 
     MTSClient *mtsClient;
@@ -262,10 +234,6 @@ public :
     // used to restore tuning state when there was a problem 
     // with loading/applying a new .SCL and/or .KBM file 
     std::shared_ptr<TuningState> synthTuningStateLast;
-
-    // Prompt for a file
-    void applySCLTuning();
-    void applyKBMMapping();
 
     // Load a file
     void applySCLTuning(File sclf);
@@ -281,24 +249,27 @@ public :
     
     std::string currentSCLData = "";
     std::string currentKBMData = "";
-    void setZoomFactor(float factor);
-    float getZoomFactor() {
-        return zoomFactor;
-    }
 
-    std::unique_ptr<JsonServer> jsonServer;
-    void renderClipToFile(const juce::File& outputFile, int midiNote = 69, float velocity = 0.8f);
-    std::atomic<bool> isRenderingClip { false };
+    //==============================================================================
+    // Offline rendering. See RenderSpec in RenderJob.h for the clip geometry.
+    //
+    // renderClip() owns the whole note-on/note-off/tail sequence and writes
+    // `spec.totalSamples()` mono samples into `out`. It runs entirely on the
+    // calling thread: no audio device, no message thread, no locks. One
+    // DexedAudioProcessor belongs to exactly one worker thread.
+    void renderClip(const RenderSpec& spec, AudioSampleBuffer& out);
 
-    void beginBatchRender();
-    void endBatchRender();
-    bool isBatchRenderActive() const { return batchRenderActive; }
+    // Sample-rate dependent lookup tables in msfa are process-global statics.
+    // They must be initialised once, before any worker thread starts, and then
+    // stay read-only for the rest of the run.
+    static void initSharedTables(double sampleRate);
+
+    // Per-instance setup at a fixed sample rate. Replaces prepareToPlay() for
+    // the CLI: allocates the voices exactly once and never touches the shared
+    // tables, so it is safe to call from a worker thread.
+    void prepareForOfflineRender(double sampleRate, int blockSize);
 
 private:
-    juce::CriticalSection renderLock;
-    bool   batchRenderActive { false };
-    double batchOrigRate     { 0.0 };
-    int    batchOrigBlock    { 0 };
     int chooseNote(uint8_t pitch);
     int32_t nextKeydownSeq;;
     //==============================================================================

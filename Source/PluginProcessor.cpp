@@ -22,7 +22,6 @@
 #include <bitset>
 
 #include "PluginProcessor.h"
-#include "PluginEditor.h"
 
 #include "Dexed.h"
 #include "msfa/synth.h"
@@ -66,68 +65,55 @@
 //==============================================================================
 DexedAudioProcessor::DexedAudioProcessor()
     : AudioProcessor(BusesProperties().withOutput("output", AudioChannelSet::stereo(), true)) {
-#ifdef DEBUG
-    // avoid creating the log file if it is in standalone mode
-    if ( !JUCEApplication::isStandaloneApp() ) {
-        Logger *tmp = Logger::getCurrentLogger();
-        if ( tmp == NULL ) {
-            Logger::setCurrentLogger(FileLogger::createDateStampedLogger("Dexed", "DebugSession-", "log", "DexedAudioProcessor Created"));
-        }
-    }
-    TRACE("Hi");
-#endif
-
+    // Exp2/Tanh/Sin fill process-global tables that do not depend on the sample
+    // rate. They are idempotent, but writing them while another thread renders
+    // would be a data race, so initSharedTables() must have run first. Calling
+    // it here as well keeps a single-instance use (tests, one-shot render)
+    // correct without any ceremony.
     Exp2::init();
     Tanh::init();
     Sin::init();
 
     synthTuningState = createStandardTuning();
     synthTuningStateLast = createStandardTuning();
-    
+
     lastStateSave = 0;
     currentNote = -1;
     engineType = -1;
-    
-    vuSignal = 0;
+
     monoMode = 0;
 
     resolvAppDir();
-    
+
     initCtrl();
-    sendSysexChange = true;
     normalizeDxVelocity = false;
-    sysexComm.listener = this;
-    showKeyboard = true;
-    
+
     memset(&voiceStatus, 0, sizeof(VoiceStatus));
     setEngineType(DEXED_ENGINE_MARKI);
-    
+
     controllers.values_[kControllerPitchRangeUp] = 3;
     controllers.values_[kControllerPitchRangeDn] = 3;
     controllers.values_[kControllerPitchStep] = 0;
     controllers.masterTune = 0;
-    
-    loadPreference();
+
+    // Deliberately no loadPreference() here. A renderer that silently changes
+    // its output based on a Dexed.xml left over in the user's home directory is
+    // useless for building datasets. The CLI sets everything it cares about.
 
     for (int note = 0; note < MAX_ACTIVE_NOTES; ++note) {
         voices[note].dx7_note = NULL;
     }
-    setCurrentProgram(0);    
+    setCurrentProgram(0);
     nextMidi = NULL;
     midiMsg = NULL;
-    
-    mtsClient = NULL;
-    mtsClient = MTS_RegisterClient();
 
-    // Start JSON parameter server for external control
-    jsonServer = std::make_unique<JsonServer>(*this);
-    jsonServer->startThread();
+    // MTS-ESP is a live retuning IPC service; there is no master to talk to in
+    // a batch render and it would make output depend on the host environment.
+    // Every MTS_* call is null-safe and falls back to standard tuning.
+    mtsClient = NULL;
 }
 
 DexedAudioProcessor::~DexedAudioProcessor() {
-    // Shut down JSON server before other members are destroyed
-    jsonServer.reset();
-
     Logger *tmp = Logger::getCurrentLogger();
 	if ( tmp != NULL ) {
 		Logger::setCurrentLogger(NULL);
@@ -138,17 +124,32 @@ DexedAudioProcessor::~DexedAudioProcessor() {
 }
 
 //==============================================================================
-void DexedAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlock) {
+// Freqlut/Lfo/PitchEnv/Env/Porta keep their tables in process-global statics
+// that are only a function of the sample rate. Rebuilding them per instance or
+// per clip is pure waste, and doing it while another worker renders is a data
+// race, so the CLI calls this exactly once up front and never again.
+void DexedAudioProcessor::initSharedTables(double sampleRate) {
+    Exp2::init();
+    Tanh::init();
+    Sin::init();
     Freqlut::init(sampleRate);
     Lfo::init(sampleRate);
     PitchEnv::init(sampleRate);
     Env::init_sr(sampleRate);
     Porta::init_sr(sampleRate);
+}
+
+// Per-instance state only. Safe to call from a worker thread once
+// initSharedTables() has run.
+void DexedAudioProcessor::prepareForOfflineRender(double sampleRate, int blockSize) {
+    setRateAndBufferSizeDetails(sampleRate, blockSize);
+
     fx.init(sampleRate);
 
-    vuDecayFactor = VuMeterOutput::getDecayFactor(sampleRate);
-    
     for (int note = 0; note < MAX_ACTIVE_NOTES; ++note) {
+        // The original prepareToPlay() overwrote this pointer without freeing
+        // it, leaking 16 Dx7Note on every call.
+        delete voices[note].dx7_note;
         voices[note].dx7_note = new Dx7Note(synthTuningState, mtsClient);
         voices[note].midi_note = -1;
         voices[note].keydown = false;
@@ -171,12 +172,17 @@ void DexedAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlock) 
     sustain = false;
     extra_buf_size = 0;
 
-    keyboardState.reset();
-    
     lfo.reset(data + 137);
-    
+
+    delete nextMidi;
+    delete midiMsg;
     nextMidi = new MidiMessage(0xF0);
 	midiMsg = new MidiMessage(0xF0);
+}
+
+void DexedAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlock) {
+    initSharedTables(sampleRate);
+    prepareForOfflineRender(sampleRate, samplesPerBlock);
 }
 
 void DexedAudioProcessor::releaseResources() {
@@ -192,7 +198,6 @@ void DexedAudioProcessor::releaseResources() {
         voices[note].live = false;
     }
 
-    keyboardState.reset();
     if ( nextMidi != NULL ) {
         delete nextMidi;
         nextMidi = NULL;
@@ -205,18 +210,11 @@ void DexedAudioProcessor::releaseResources() {
 
 void DexedAudioProcessor::processBlock(AudioSampleBuffer& buffer, MidiBuffer& midiMessages) {
 
-    // Yield silently to the offline rendering thread when it holds renderLock
-    juce::GenericScopedTryLock<juce::CriticalSection> renderGuard(renderLock);
-    if (!renderGuard.isLocked()) {
-        buffer.clear();
-        return;
-    }
-
     juce::ScopedNoDenormals noDenormals;
 
     int numSamples = buffer.getNumSamples();
     int i;
-    
+
     if ( refreshVoice ) {
         for(i=0;i < MAX_ACTIVE_NOTES;i++) {
             if ( voices[i].live )
@@ -224,11 +222,10 @@ void DexedAudioProcessor::processBlock(AudioSampleBuffer& buffer, MidiBuffer& mi
         }
         lfo.reset(data + 137);
         refreshVoice = false;
+        fmPermanentlySilent = false;
+        silentChunkSamples = 0;
     }
 
-    if (!batchRenderActive)
-        keyboardState.processNextMidiBuffer(midiMessages, 0, numSamples, true);
-    
     MidiBuffer::Iterator it(midiMessages);
     hasMidiMessage = it.getNextEvent(*nextMidi,midiEventPos);
 
@@ -254,32 +251,38 @@ void DexedAudioProcessor::processBlock(AudioSampleBuffer& buffer, MidiBuffer& mi
         for (; i < numSamples; i += N) {
             AlignedBuf<int32_t, N> audiobuf;
             float sumbuf[N];
-            
+
             while(getNextEvent(&it, i)) {
                 processMidiMessage(midiMsg);
             }
-            
+
             for (int j = 0; j < N; ++j) {
                 audiobuf.get()[j] = 0;
                 sumbuf[j] = 0;
             }
+
+            if (fmPermanentlySilent) {
+                // Proven below to stay exactly zero, so sumbuf stays zeroed and
+                // the whole FM path is skipped. The filter below still runs on
+                // these zeros, which is what keeps the output bit-identical.
+            } else {
             int32_t lfovalue = lfo.getsample();
             int32_t lfodelay = lfo.getdelay();
-            
+
             bool checkMTSESPRetuning = synthTuningState->is_standard_tuning() &&
                                         MTS_HasMaster(mtsClient);
-            
+
             for (int note = 0; note < MAX_ACTIVE_NOTES; ++note) {
                 if (voices[note].live) {
-                    
+
                     if (checkMTSESPRetuning)
                         voices[note].dx7_note->updateBasePitches();
-                    
+
                     voices[note].dx7_note->compute(audiobuf.get(), lfovalue, lfodelay, &controllers);
-                    
+
                     for (int j=0; j < N; ++j) {
                         int32_t val = audiobuf.get()[j];
-                        
+
                         val = val >> 4;
                         int clip_val = val < -(1 << 24) ? 0x8000 : val >= (1 << 24) ? 0x7fff : val >> 9;
                         float f = ((float) clip_val) / (float) 0x8000;
@@ -290,7 +293,11 @@ void DexedAudioProcessor::processBlock(AudioSampleBuffer& buffer, MidiBuffer& mi
                     }
                 }
             }
-            
+
+            if (skipDeadVoices)
+                trackFmSilence(sumbuf);
+            }
+
             int jmax = numSamples - i;
             for (int j = 0; j < N; ++j) {
                 if (j < jmax) {
@@ -302,33 +309,55 @@ void DexedAudioProcessor::processBlock(AudioSampleBuffer& buffer, MidiBuffer& mi
         }
         extra_buf_size = i - numSamples;
     }
-    
+
     while(getNextEvent(&it, numSamples)) {
         processMidiMessage(midiMsg);
     }
 
     fx.process(channelData, numSamples);
 
-    for(i=0; i<numSamples; i++) {
-        float s = std::abs(channelData[i]);
-
-        if (s > vuSignal)
-            vuSignal = s;
-        else if (vuSignal > /*0.001f*/ 1.26E-4F) // 1.26E-4 is equivalent to -39 dB, the min amplitude associated to leftmost LED
-            vuSignal *= vuDecayFactor;
-        else
-            vuSignal = 0;
-    }
-    
     // DX7 is a mono synth, but copy it to the right channel is available
     if ( buffer.getNumChannels() > 1 )
         buffer.copyFrom(1, 0, channelData, numSamples, 1);
 }
 
-//==============================================================================
-// This creates new instances of the plugin..
-AudioProcessor* JUCE_CALLTYPE createPluginFilter() {
-    return new DexedAudioProcessor();
+/**
+ * Decide whether the FM engine can be switched off for the rest of the clip.
+ *
+ * Once every carrier envelope has gone inactive the envelopes are frozen: for
+ * ix_ >= 4 Env::getsample() stops advancing, so operator gains only still move
+ * because of the LFO. The LFO repeats every periodSamples(), so an observed run
+ * of exactly-zero output that covers a full LFO cycle (plus one chunk, so the
+ * previous-gain term in fm_op_kernel has settled too) means every subsequent
+ * cycle produces exactly the same zeros.
+ *
+ * The conservative cases -- sample & hold, an LFO delay ramp that has not
+ * topped out yet -- simply never arm the flag and render in full.
+ */
+void DexedAudioProcessor::trackFmSilence(const float* sumbuf) {
+    for (int j = 0; j < N; ++j) {
+        if (sumbuf[j] != 0.0f) {
+            silentChunkSamples = 0;
+            return;
+        }
+    }
+
+    for (int note = 0; note < MAX_ACTIVE_NOTES; ++note) {
+        if (voices[note].live && voices[note].dx7_note->isPlaying()) {
+            silentChunkSamples = 0;
+            return;
+        }
+    }
+
+    const uint64_t period = lfo.periodSamples();
+    if (period == 0 || !lfo.delayIsSaturated()) {
+        silentChunkSamples = 0;
+        return;
+    }
+
+    silentChunkSamples += N;
+    if (silentChunkSamples >= period + N)
+        fmPermanentlySilent = true;
 }
 
 bool DexedAudioProcessor::getNextEvent(MidiBuffer::Iterator* iter,const int samplePos) {
@@ -342,7 +371,7 @@ bool DexedAudioProcessor::getNextEvent(MidiBuffer::Iterator* iter,const int samp
 
 void DexedAudioProcessor::processMidiMessage(const MidiMessage *msg) {
     if ( msg->isSysEx() ) {
-        handleIncomingMidiMessage(NULL, *msg);
+        handleIncomingMidiMessage(*msg);
         return;
     }
 
@@ -449,14 +478,10 @@ void DexedAudioProcessor::processMidiMessage(const MidiMessage *msg) {
                     TRACE("handle channel %d CC %d = %d", channel, ctrl, value);
                     int channel_cc = (channel << 8) | ctrl;
                     if ( mappedMidiCC.contains(channel_cc) ) {
-                        Ctrl *linkedCtrl = mappedMidiCC[channel_cc];
-                        
-                        // We are not publishing this in the DSP thread, moving that in the
-                        // event thread
-                        linkedCtrl->publishValueAsync((float) value / 127);
+                        // Rendering is single threaded, so unlike the plugin
+                        // there is no DSP/event thread split to defer across.
+                        mappedMidiCC[channel_cc]->setValueHost((float) value / 127);
                     }
-                    // this is used to notify the dialog that a CC value was received.
-                    lastCCUsed.setValue(channel_cc);
                 }
             }
             return;
@@ -669,16 +694,11 @@ void DexedAudioProcessor::panic() {
             voices[i].dx7_note->oscSync();
         }
     }
-    keyboardState.reset();
 }
 
-void DexedAudioProcessor::handleIncomingMidiMessage(MidiInput* source, const MidiMessage& message) {
-    if ( message.isActiveSense() ) 
+void DexedAudioProcessor::handleIncomingMidiMessage(const MidiMessage& message) {
+    if ( message.isActiveSense() )
         return;
-
-#ifdef IMPLEMENT_MidiMonitor
-    sysexComm.inActivity = true; // indicate to MidiMonitor that a MIDI messages (other than Active Sense) is received
-#endif //IMPLEMENT_MidiMonitor
 
     const uint8 *buf = message.getRawData();
     int sz = message.getRawDataSize();
@@ -746,27 +766,16 @@ void DexedAudioProcessor::handleIncomingMidiMessage(MidiInput* source, const Mid
             }
         }
         break;
-        case 2: {
-            if ( buf[3] == 0 ) {
-                // single voice request
-                sendCurrentSysexProgram();
-            } else if ( buf[3] == 9 ) {
-                // cart request
-                sendCurrentSysexCartridge();
-            } else {
-                TRACE("Unknown voice request: %d", buf[3]);
-            }
-        }
-        return;
+        case 2:
+            // Voice/cart dump requests need a MIDI output to answer on; the
+            // CLI has none.
+            return;
 
         default: {
             TRACE("unknown sysex substatus: %d", substatus);
         }
         return;
     }
-
-    forceRefreshUI = true;
-    triggerAsyncUpdate();
 }
 
 int DexedAudioProcessor::getEngineType() {
@@ -793,36 +802,6 @@ void DexedAudioProcessor::setEngineType(int tp) {
 void DexedAudioProcessor::setMonoMode(bool mode) {
     panic();
     monoMode = mode;
-}
-
-// ====================================================================
-bool DexedAudioProcessor::peekVoiceStatus() {
-    if ( currentNote == -1 )
-        return false;
-
-    // we are trying to find the last "keydown" note
-    int note = currentNote;
-    for (int i = 0; i < MAX_ACTIVE_NOTES; i++) {
-        if (voices[note].keydown) {
-            voices[note].dx7_note->peekVoiceStatus(voiceStatus);
-            return true;
-        }
-        if ( --note < 0 )
-            note = MAX_ACTIVE_NOTES-1;
-    }
-
-    // not found; try a live note
-    note = currentNote;
-    for (int i = 0; i < MAX_ACTIVE_NOTES; i++) {
-        if (voices[note].live) {
-            voices[note].dx7_note->peekVoiceStatus(voiceStatus);
-            return true;
-        }
-        if ( --note < 0 )
-            note = MAX_ACTIVE_NOTES-1;
-    }
-
-    return true;
 }
 
 const String DexedAudioProcessor::getInputChannelName (int channelIndex) const {
@@ -867,135 +846,82 @@ const String DexedAudioProcessor::getName() const {
 }
 
 //==============================================================================
-bool DexedAudioProcessor::hasEditor() const {
-    return true; // (change this to false if you choose to not supply an editor)
-}
-
-void DexedAudioProcessor::updateUI() {
-    // notify host something has changed
-    updateHostDisplay();
- 
-    AudioProcessorEditor *editor = getActiveEditor();
-    if ( editor == NULL ) {
-        return;
-    }
-	DexedAudioProcessorEditor *dexedEditor = (DexedAudioProcessorEditor *) editor;
-    dexedEditor->updateUI();
-}
-
-AudioProcessorEditor* DexedAudioProcessor::createEditor() {
-    AudioProcessorEditor* editor = new DexedAudioProcessorEditor (this);
-    return editor;
-}
-
-void DexedAudioProcessor::setZoomFactor(float factor) {
-    zoomFactor = factor;
-}
-
-// Offline audio clip renderer: 120 BPM, 4 beats sound + 4 beats tail, 48kHz/32bit/mono WAV
-void DexedAudioProcessor::renderClipToFile(const juce::File& outputFile, int midiNote, float velocity)
+/**
+ * Render one clip: note on at sample 0, note off after spec.soundSamples(),
+ * then the tail. `out` is resized to one channel of spec.totalSamples().
+ *
+ * Everything happens on the calling thread. The voices are reset first, so a
+ * single processor instance can render clip after clip without any of the
+ * rebuild-the-world cost the old renderClipToFile() paid per call.
+ */
+void DexedAudioProcessor::renderClip(const RenderSpec& spec, AudioSampleBuffer& out)
 {
-    constexpr double RENDER_RATE  = 48000.0;
-    constexpr int    BLOCK_SIZE   = 512;
-    constexpr double BPM          = 120.0;
-    constexpr int    SOUND_BEATS  = 4;
-    constexpr int    TAIL_BEATS   = 4;
+    const int soundSamples = spec.soundSamples();
+    const int totalSamples = spec.totalSamples();
+    const int blockSize    = juce::jmax(N, spec.blockSize);
 
-    const double beatsPerSec  = BPM / 60.0;
-    const int soundSamples    = juce::roundToInt(SOUND_BEATS / beatsPerSec * RENDER_RATE); // 96000
-    const int tailSamples     = juce::roundToInt(TAIL_BEATS  / beatsPerSec * RENDER_RATE); // 96000
-    const int totalSamples    = soundSamples + tailSamples;                                // 192000
+    // A fresh clip must not inherit ringing voices or a settled filter from the
+    // previous one, otherwise batch output would depend on job ordering. panic()
+    // alone is not enough: it leaves the Dx7Note objects playing, and keydown()
+    // treats a still-playing note as a voice steal and skips the oscillator
+    // sync, which would change the attack. Reset them to construction state,
+    // which is exactly what the plugin got from prepareToPlay() per clip.
+    panic();
+    for (int note = 0; note < MAX_ACTIVE_NOTES; ++note)
+        if (voices[note].dx7_note != nullptr)
+            voices[note].dx7_note->reset();
 
-    isRenderingClip = true;
+    currentNote    = 0;
+    nextKeydownSeq = 0;
+    sustain        = false;
 
-    const double origRate  = getSampleRate();
-    const int    origBlock = getBlockSize();
+    fx.init(spec.sampleRate);
+    extra_buf_size = 0;
+    lfo.resetState();
+    lfo.reset(data + 137);
+    fmPermanentlySilent = false;
+    silentChunkSamples  = 0;
+    skipDeadVoices      = spec.skipDeadVoices;
 
-    juce::AudioSampleBuffer renderBuf(1, BLOCK_SIZE);
-    juce::AudioSampleBuffer monoBuf(1, totalSamples);
+    out.setSize(1, totalSamples, false, false, true);
+    out.clear();
 
+    AudioSampleBuffer renderBuf(1, blockSize);
+
+    bool noteOnSent  = false;
+    bool noteOffSent = false;
+    int  samplePos   = 0;
+
+    while (samplePos < totalSamples)
     {
-        juce::ScopedLock lock(renderLock); // re-entrant in batch mode; audio thread stays silent
+        const int blockLen = juce::jmin(blockSize, totalSamples - samplePos);
+        renderBuf.setSize(1, blockLen, false, true, false);
+        renderBuf.clear();
 
-        if (!batchRenderActive)
-            prepareToPlay(RENDER_RATE, BLOCK_SIZE);
+        MidiBuffer midi;
 
-        bool noteOnSent  = false;
-        bool noteOffSent = false;
-        int  samplePos   = 0;
-        while (samplePos < totalSamples)
+        if (!noteOnSent)
         {
-            const int blockLen = juce::jmin(BLOCK_SIZE, totalSamples - samplePos);
-            renderBuf.setSize(1, blockLen, false, true, false);
-            renderBuf.clear();
-
-            juce::MidiBuffer midi;
-
-            if (!noteOnSent)
-            {
-                midi.addEvent(juce::MidiMessage::noteOn(1, midiNote,
-                    (uint8_t)juce::roundToInt(velocity * 127.0f)), 0);
-                noteOnSent = true;
-            }
-
-            if (!noteOffSent && samplePos + blockLen > soundSamples)
-            {
-                midi.addEvent(juce::MidiMessage::noteOff(1, midiNote),
-                    juce::jmax(0, soundSamples - samplePos));
-                noteOffSent = true;
-            }
-
-            processBlock(renderBuf, midi); // reentrant: same thread already owns renderLock
-
-            juce::FloatVectorOperations::copy(
-                monoBuf.getWritePointer(0, samplePos),
-                renderBuf.getReadPointer(0),
-                blockLen);
-
-            samplePos += blockLen;
+            midi.addEvent(MidiMessage::noteOn(1, spec.midiNote,
+                (uint8_t) juce::roundToInt(spec.velocity * 127.0f)), 0);
+            noteOnSent = true;
         }
 
-        if (!batchRenderActive)
-            prepareToPlay(origRate > 0.0 ? origRate : 44100.0,
-                          origBlock > 0  ? origBlock : 512);
+        if (!noteOffSent && samplePos + blockLen > soundSamples)
+        {
+            midi.addEvent(MidiMessage::noteOff(1, spec.midiNote),
+                juce::jmax(0, soundSamples - samplePos));
+            noteOffSent = true;
+        }
+
+        processBlock(renderBuf, midi);
+
+        FloatVectorOperations::copy(out.getWritePointer(0, samplePos),
+                                    renderBuf.getReadPointer(0),
+                                    blockLen);
+
+        samplePos += blockLen;
     }
-
-    isRenderingClip = false;
-
-    // Write 48 kHz / 32-bit float / mono WAV
-    juce::WavAudioFormat wavFormat;
-    auto outStream = outputFile.createOutputStream();
-    if (!outStream) return;
-
-    auto* rawStream = outStream.get();
-    auto writer = std::unique_ptr<juce::AudioFormatWriter>(
-        wavFormat.createWriterFor(rawStream, RENDER_RATE, 1, 32, {}, 0));
-    if (!writer) return;
-
-    outStream.release(); // writer owns the stream now
-    writer->writeFromAudioSampleBuffer(monoBuf, 0, totalSamples);
-}
-
-void DexedAudioProcessor::beginBatchRender()
-{
-    batchOrigRate  = getSampleRate();
-    batchOrigBlock = getBlockSize();
-    renderLock.enter();   // audio callback returns silence (TryLock fails) for entire batch
-    prepareToPlay(48000.0, 512);
-    batchRenderActive = true;
-}
-
-void DexedAudioProcessor::endBatchRender()
-{
-    batchRenderActive = false;
-    prepareToPlay(batchOrigRate  > 0.0 ? batchOrigRate  : 44100.0,
-                  batchOrigBlock > 0   ? batchOrigBlock : 512);
-    renderLock.exit();
-}
-
-void DexedAudioProcessor::handleAsyncUpdate() {
-    if (batchRenderActive)
-        return;
 }
 
 void dexed_trace(const char *source, const char *fmt, ...) {
@@ -1024,51 +950,6 @@ void DexedAudioProcessor::retuneToStandard()
     currentSCLData = "";
     currentKBMData = "";
     resetTuning(createStandardTuning());
-}
-
-void DexedAudioProcessor::applySCLTuning() {
-    FileChooser fc( "Please select a scale (.scl) file.", File(), "*.scl" );
-    File s;
-
-    // loop to enforce the proper selection
-    for (;;) {
-        // open file chooser dialog
-        if (!fc.browseForFileToOpen())
-            // User cancelled
-            return;
-        s = fc.getResult();
-
-        // enforce file extenstion ''.scl''.
-        // (reason: the extension ''.scl'' is mandatory according to 
-        // ''https://www.huygens-fokker.org/scala/scl_format.html''
-        if (s.getFileExtension() != ".scl") {
-            AlertWindow::showMessageBox(AlertWindow::WarningIcon, "Invalid file type!", "Only files with the \".scl\" extension (in lowercase!) are allowed.");
-            continue;
-        }
-
-        // enforce to select file below the max limit16KB sized files
-        if (s.getSize() > MAX_SCL_KBM_FILE_SIZE) {
-            std::string msg;
-            msg = "File size exceeded the maximum limit of " + std::to_string(MAX_SCL_KBM_FILE_SIZE) + " bytes.";
-            AlertWindow::showMessageBox(AlertWindow::WarningIcon, "File size error!", msg);
-            continue;
-        }
-
-        // enforce to select non-empty file
-        // TODO: check, whether zero sized files may occur indeed here; if not, delete this if-statement, please
-        if (s.getSize() == 0) {
-            std::string msg;
-            msg = "File is empty.";
-            AlertWindow::showMessageBox(AlertWindow::WarningIcon, "File size error!", msg);
-            continue;
-        }
-
-        // try to apply the SCL file 
-        applySCLTuning(s);
-
-        // exit the loop
-        break;
-    }
 }
 
 void DexedAudioProcessor::applySCLTuning(File s) {
@@ -1100,50 +981,6 @@ void DexedAudioProcessor::applySCLTuning(std::string sclcontents) {
         else {            
             resetTuning(synthTuningStateLast); // revert to the "last good working state"
         }
-    }
-}
-
-void DexedAudioProcessor::applyKBMMapping() {
-    FileChooser fc( "Please select a keyboard map (.kbm) file.", File(), "*.kbm" );
-    File s;
-
-    // loop to enforce the proper selection
-    for (;;) {
-        // invoke file chooser dialog
-        if (!fc.browseForFileToOpen())            
-            return; // User cancelled
-        s = fc.getResult();
-
-        // enforce file extenstion ''.kbm''.
-        // (reason: the extension ''.kbm'' is mandatory according to 
-        // ''https://www.huygens-fokker.org/scala/scl_format.html''
-        if (s.getFileExtension() != ".kbm") {
-            AlertWindow::showMessageBox(AlertWindow::WarningIcon, "Invalid file type!", "Only files with the \".kbm\" extension (in lowercase!) are allowed.");
-            continue;
-        }
-
-        // enforce to select file below the max limit16KB sized files
-        if (s.getSize() > MAX_SCL_KBM_FILE_SIZE) {
-            std::string msg;
-            msg = "File size exceeded the maximum limit of " + std::to_string(MAX_SCL_KBM_FILE_SIZE) + " bytes.";
-            AlertWindow::showMessageBox(AlertWindow::WarningIcon, "File size error!", msg);
-            continue;
-        }
-
-        // enforce to select non-empty file
-        // TODO: check, whether zero sized files may occur indeed here; if not, delete this if-statement, please
-        if (s.getSize() == 0) {
-            std::string msg;
-            msg = "File is empty.";
-            AlertWindow::showMessageBox(AlertWindow::WarningIcon, "File size error!", msg);
-            continue;
-        }
-
-        // try to apply KBM mapping
-        applyKBMMapping(s);
-
-        // exit the loop
-        break;
     }
 }
 

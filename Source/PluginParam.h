@@ -23,50 +23,32 @@
 
 #include "../JuceLibraryCode/JuceHeader.h"
 
-#include <juce_gui_basics/detail/juce_ButtonAccessibilityHandler.h>
-#include <juce_gui_basics/juce_gui_basics.h>
-
 class DexedAudioProcessor;
 
-class Ctrl : public Slider::Listener, public Button::Listener, public ComboBox::Listener, public MouseListener {
-protected:
-    /**
-     * Binded components of the UI
-     */
-    Slider *slider;
-    Button *button;
-    ComboBox *comboBox;
-
+/**
+ * One addressable synth parameter.
+ *
+ * In the plugin this also acted as the glue to a Slider/Button/ComboBox; the
+ * CLI has no components, so all that remains is the value mapping between the
+ * host's normalised 0..1 range and the DX7 representation.
+ */
+class Ctrl {
 public:
     String label;
 
     Ctrl(String name);
-    void bind(Slider *s);
-    void bind(Button *b);
-    void bind(ComboBox *c);
-    void unbind();
+    virtual ~Ctrl() = default;
 
     // use this to signal a parameter change to the host
     void publishValue(float value);
-    
-    // use this to publish a new value to be computed on the event thread
-    void publishValueAsync(float value);
-    
+
     /**
      * Host value is related 0.0 to 1.0 values
      */
     virtual void setValueHost(float f) = 0;
     virtual float getValueHost() = 0;
     virtual String getValueDisplay() = 0;
-    virtual void updateComponent() = 0;
 
-    void comboBoxChanged (ComboBox* combo);
-    void sliderValueChanged (Slider* moved);
-    void buttonClicked (Button* buttonThatWasClicked);
-    void mouseEnter(const MouseEvent &event);
-    void mouseDown(const MouseEvent &event);
-    virtual void updateDisplayName();
-    
     /**
      * Index of this parameter
      */
@@ -82,7 +64,6 @@ public:
 	void setValueHost(float f);
 	float getValueHost();
 	String getValueDisplay();
-    void updateComponent();
 };
 
 // CtrlDX is a controller that is related to DX parameters
@@ -91,24 +72,17 @@ class CtrlDX : public Ctrl {
     int steps;
     int dxOffset;
     int displayValue;
-    
+
 public:
     CtrlDX(String name, int steps, int offset = -1, int displayValue = 0);
     void setValueHost(float f);
     float getValueHost();
     void publishValue(float value);
-    
+
     void setValue(int value);
     int getValue();
     int getOffset();
     String getValueDisplay();
-    
-    void sliderValueChanged (Slider* moved);
-    void comboBoxChanged (ComboBox* combo);
-    void buttonClicked (Button* buttonThatWasClicked);
-    void updateComponent();
-    
-    void updateDisplayName();
 };
 
 struct OperatorCtrl {
