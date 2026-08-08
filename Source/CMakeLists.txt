@@ -1,64 +1,25 @@
-set(BaseTargetName Dexed)
+set(BaseTargetName dexed-cli)
 
-set(DEXED_JUCE_FORMATS Standalone)
-
-if(NOT DEXED_SKIP_VST3)
-  list(APPEND DEXED_JUCE_FORMATS VST3)
-endif()
-
-if (APPLE)
-  list(APPEND DEXED_JUCE_FORMATS AU)
-endif()
-
-message(STATUS "Building Dexed in formats: ${DEXED_JUCE_FORMATS}")
-
-juce_add_plugin("${BaseTargetName}"
+juce_add_console_app("${BaseTargetName}"
         VERSION "1.0.1"
-        ICON_BIG "../assets/ui/dexedIcon.png"
-        ICON_SMALL "../assets/ui/dexedIcon.png"
         COMPANY_NAME "Digital Suburban"
-        IS_SYNTH TRUE
-        NEEDS_MIDI_INPUT TRUE
-        NEEDS_MIDI_OUTPUT TRUE
-        IS_MIDI_EFFECT FALSE
-        EDITOR_WANTS_KEYBOARD_FOCUS TRUE
-        PLUGIN_MANUFACTURER_CODE DGSB
-        PLUGIN_CODE Dexd
-        FORMATS ${DEXED_JUCE_FORMATS}
-        PRODUCT_NAME "Dexed"
-        DESCRIPTION "Dexed FM Synth"
-        BUNDLE_ID "com.digitalsuburban.Dexed"  # To avoid CMake Warning at libs/JUCE/extras/Build/CMake/JUCEUtils.cmake
-        COPY_PLUGIN_AFTER_BUILD FALSE
+        PRODUCT_NAME "dexed-cli"
+        BUNDLE_ID "com.digitalsuburban.dexed-cli"
 )
 
-clap_juce_extensions_plugin(TARGET ${BaseTargetName}
-        CLAP_ID "com.digital-suburban.dexed"
-        CLAP_FEATURES instrument FM DX7)
-
-juce_generate_juce_header(${PROJECT_NAME})
+juce_generate_juce_header(${BaseTargetName})
 
 include_directories(../libs/MTS-ESP/Client)
 
 target_sources(${BaseTargetName} PRIVATE
-	AlgoDisplay.cpp
-	CartManager.cpp
-    JsonServer.cpp
-	DXComponents.cpp
-	DXLookNFeel.cpp
-	EngineMkI.cpp
-	EngineOpl.cpp
-	GlobalEditor.cpp
-	OperatorEditor.cpp
-	ParamDialog.cpp
-	PluginData.cpp
-	PluginEditor.cpp
-	PluginFx.cpp
-	PluginParam.cpp
-	PluginProcessor.cpp
-	ProgramListBox.cpp
-	SysexComm.cpp
-	TuningShow.cpp
-	VUMeter.cpp
+        MainCli.cpp
+        RenderJob.cpp
+        EngineMkI.cpp
+        EngineOpl.cpp
+        PluginData.cpp
+        PluginFx.cpp
+        PluginParam.cpp
+        PluginProcessor.cpp
         msfa/dx7note.cc
         msfa/env.cc
         msfa/exp2.cc
@@ -75,40 +36,31 @@ target_sources(${BaseTargetName} PRIVATE
     ../libs/MTS-ESP/Client/libMTSClient.cpp
 )
 
-if(DEXED_NO_ALSA)
-    set(DEXED_ALSA FALSE)
-    message(STATUS "Building Dexed without ALSA support")
-else()
-    set(DEXED_ALSA TRUE)
-endif()
-
 target_compile_definitions(${BaseTargetName} PUBLIC
+    DEXED_HEADLESS=1
+    JucePlugin_Name="Dexed"
     JUCE_WEB_BROWSER=0
     JUCE_USE_CURL=0
-    JUCE_VST3_CAN_REPLACE_VST2=0
-    JUCE_JACK=1
-    JUCE_ALSA=$<IF:$<BOOL:${DEXED_ALSA}>,1,0>
-    JUCE_MODAL_LOOPS_PERMITTED=1 # needed for FileBrowser in CartManager
     JUCE_DISPLAY_SPLASH_SCREEN=0
     JUCE_REPORT_APP_USAGE=0
-    # JUCE_COREGRAPHICS_RENDER_WITH_MULTIPLE_PAINT_CALLS=1     # REVERT BACK SINCE THERE IS AN ISSUE WITH JUCE 7.0.0
+    JUCE_STANDALONE_APPLICATION=1
+    # No audio hardware is ever opened, so the device backends are dead weight.
+    JUCE_JACK=0
+    JUCE_ALSA=0
 )
 
-target_link_libraries(${BaseTargetName} 
+# juce_audio_processors pulls juce_gui_extra -> juce_gui_basics -> juce_graphics
+# in through its module dependencies, so those get linked whether we want them
+# or not. Nothing here ever constructs a Component, so no display is opened:
+# JUCE dlopens libX11 lazily and we never reach that path.
+target_link_libraries(${BaseTargetName}
 PRIVATE
     juce::juce_audio_basics
-    juce::juce_audio_devices
     juce::juce_audio_formats
-    juce::juce_audio_plugin_client
     juce::juce_audio_processors
-    juce::juce_audio_utils
     juce::juce_core
     juce::juce_data_structures
     juce::juce_events
-    juce::juce_graphics
-    juce::juce_gui_basics
-    juce::juce_gui_extra
-    surgesynthteam_tuningui
     tuning-library
     DexedResources
 PUBLIC

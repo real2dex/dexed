@@ -23,158 +23,18 @@
 
 #include "PluginParam.h"
 #include "PluginProcessor.h"
-#include "PluginEditor.h"
 #include "Dexed.h"
-
-// Async updater
-class CtrlUpdate : public CallbackMessage {
-    Ctrl *ctrl;
-    float value;
-public:
-    CtrlUpdate(Ctrl *ctrl, float value) {
-        this->ctrl = ctrl;
-        this->value = value;
-    }
-    void messageCallback() {
-        ctrl->publishValue(value);
-    }
-};
 
 // ************************************************************************
 //
 Ctrl::Ctrl(String name) {
     label << name;
-    slider = NULL;
-    button = NULL;
-    comboBox = NULL;
-}
-
-void Ctrl::bind(Slider *s) {
-    slider = s;
-    updateComponent();
-    s->addListener(this);
-    s->addMouseListener(this, true);
-    s->setVelocityModeParameters (0.1, 1, 0.05, 1, ModifierKeys::shiftModifier);
-    s->setTitle(label);
-    s->textFromValueFunction = [this](double value) { return this->getValueDisplay(); };
-    s->setWantsKeyboardFocus(true);
-}
-
-void Ctrl::bind(Button *b) {
-    button = b;
-    updateComponent();
-    b->setTitle(label);
-    b->addListener(this);
-    b->addMouseListener(this, true);
-}
-
-void Ctrl::bind(ComboBox *c) {
-    comboBox = c;
-    updateComponent();
-    c->setTitle(label);
-    c->addListener(this);
-    c->addMouseListener(this, true);
-}
-
-void Ctrl::unbind() {
-    if (slider != NULL) {
-        slider->removeListener(this);
-        slider->removeMouseListener(this);
-        slider = NULL;
-    }
-
-    if (button != NULL) {
-        button->removeListener(this);
-        button->removeMouseListener(this);
-        button = NULL;
-    }
-
-    if (comboBox != NULL) {
-        comboBox->removeListener(this);
-        comboBox->removeMouseListener(this);
-        comboBox = NULL;
-    }
-}
-
-void Ctrl::publishValueAsync(float value) {
-    CtrlUpdate *update = new CtrlUpdate(this, value);
-    update->post();
 }
 
 void Ctrl::publishValue(float value) {
     parent->beginParameterChangeGesture(idx);
     parent->setParameterNotifyingHost(idx, value);
     parent->endParameterChangeGesture(idx);
-}
-
-void Ctrl::sliderValueChanged(Slider* moved) {
-    publishValue(moved->getValue());
-}
-
-void Ctrl::buttonClicked(Button* clicked) {
-    publishValue(clicked->getToggleState());
-}
-
-void Ctrl::comboBoxChanged(ComboBox* combo) {
-    publishValue((combo->getSelectedId() - 1) / combo->getNumItems());
-}
-
-void Ctrl::mouseEnter(const juce::MouseEvent &event) {
-    updateDisplayName();
-}
-
-void Ctrl::mouseDown(const juce::MouseEvent &event) {
-    if ( event.mods.isPopupMenu()) {
-        PopupMenu popup;
-
-        if ( parent->mappedMidiCC.containsValue(this) ) {
-            popup.addItem(3, "Re-Map controller to midi CC for: " + String(label));
-            popup.addSeparator();
-            popup.addItem(1, "Remove midi CC mapping for this controller");
-        } else {
-            popup.addItem(3, "Map controller to midi CC for: " + String(label));
-            popup.addSeparator();
-        }
-        popup.addItem(2, "Clear midi CC mapping");
-
-        if ( parent->getZoomFactor() > 1.0f ) {
-            popup.addSeparator();
-            popup.addItem(5, "Reset plugin UI scaling factor");
-        }
-
-        switch(popup.show()) {
-            case 1:
-                parent->mappedMidiCC.removeValue(this);
-                parent->savePreference();
-                break;
-            case 2:
-                if ( AlertWindow::showYesNoCancelBox(AlertWindow::WarningIcon, "Confirm", "Clear midi mapping for all controller change (CC) messages?", "YES", "NO", "CANCEL") ) {
-                    parent->mappedMidiCC.clear();
-                    parent->savePreference();
-                }
-                break;
-            case 3: {
-                AudioProcessorEditor *editor = parent->getActiveEditor();
-                if ( editor == NULL ) {
-                    return;
-                }
-                DexedAudioProcessorEditor *dexedEditor = (DexedAudioProcessorEditor *) editor;
-                dexedEditor->discoverMidiCC(this);
-            }
-            break;
-
-            case 5: {
-                auto *editor = dynamic_cast<DexedAudioProcessorEditor*>(parent->getActiveEditor());
-                if ( editor != nullptr ) {
-                    editor->resetZoomFactor();
-                }
-            }
-            break;
-        }
-    }
-}
-
-void Ctrl::updateDisplayName() {
 }
 
 // ************************************************************************
@@ -279,12 +139,6 @@ public:
         display << (getValueHost() * 2) -1;
         return display;
     }
-    
-    void updateComponent() {
-        if (slider != NULL) {
-            slider->setValue(getValueHost(), dontSendNotification);
-        }
-    }
 };
 
 class CtrlOpSwitch : public Ctrl {
@@ -301,8 +155,7 @@ public :
             *value = '0';
         else
             *value = '1';
-        updateDisplayName();
-        
+
         // the value is based on the controller
         parent->setDxValue(155, -1);
     }
@@ -318,24 +171,6 @@ public :
         String ret;
         ret << label << " " << (*value == '0' ? "OFF" : "ON");
         return ret;
-    }
-    
-    void updateComponent() {
-        if (button != NULL) {
-            if (*value == '0') {
-                button->setToggleState(false, dontSendNotification);
-            } else {
-                button->setToggleState(true, dontSendNotification);
-            }
-        }
-    }
-    
-    void updateDisplayName() {
-        DexedAudioProcessorEditor *editor = (DexedAudioProcessorEditor *) parent->getActiveEditor();
-        if ( editor == NULL ) {
-            return;
-        }
-        editor->global.setParamMessage(getValueDisplay());
     }
 };
 
@@ -356,12 +191,6 @@ public:
 
     void setValueHost(float v) {
         processor->setMonoMode(v == 1);
-    }
-
-    void updateComponent() {
-        if (button != NULL) {
-            button->setToggleState(processor->isMonoMode(), dontSendNotification);
-        }
     }
 };
 
@@ -384,12 +213,6 @@ String CtrlFloat::getValueDisplay() {
     String display;
     display << *vPointer;
     return display;
-}
-
-void CtrlFloat::updateComponent() {
-    if (slider != NULL) {
-        slider->setValue(*vPointer, dontSendNotification);
-    }
 }
 
 // ************************************************************************
@@ -434,55 +257,8 @@ String CtrlDX::getValueDisplay() {
     return ret;
 }
 
-void CtrlDX::updateDisplayName() {
-    DexedAudioProcessorEditor *editor = (DexedAudioProcessorEditor *) parent->getActiveEditor();
-    if ( editor == NULL ) {
-        return;
-    }
-    String msg;
-    msg << label << " = " << getValueDisplay();
-    editor->global.setParamMessage(msg);
-}
-
-
 void CtrlDX::publishValue(float value) {
     Ctrl::publishValue(value / steps);
-    updateDisplayName();
-}
-
-void CtrlDX::sliderValueChanged(Slider* moved) {
-    publishValue(((int) moved->getValue() - displayValue));
-}
-
-void CtrlDX::comboBoxChanged(ComboBox* combo) {
-    publishValue(combo->getSelectedId() - 1);
-}
-
-void CtrlDX::buttonClicked(Button *button) {
-    publishValue((int) button->getToggleState());
-}
-
-void CtrlDX::updateComponent() {
-    if (slider != NULL) {
-        slider->setValue(getValue() + displayValue,
-                dontSendNotification);
-    }
-
-    if (button != NULL) {
-        if (getValue() == 0) {
-            button->setToggleState(false, dontSendNotification);
-        } else {
-            button->setToggleState(true, dontSendNotification);
-        }
-    }
-
-    if (comboBox != NULL) {
-        int cvalue = getValue() + 1;
-        if (comboBox->getNumItems() <= cvalue) {
-            cvalue = comboBox->getNumItems();
-        }
-        comboBox->setSelectedId(cvalue, dontSendNotification);
-    }
 }
 
 /***************************************************************
@@ -689,24 +465,6 @@ void DexedAudioProcessor::setDxValue(int offset, int v) {
     // MIDDLE C (transpose)
     if (offset == 144)
         panic();
-    
-    if (!sendSysexChange)
-        return;
-    
-    uint8 msg[7] = { 0xF0, 0x43, 0x10, offset > 127, 0, (uint8) v, 0xF7 };
-    msg[2] = 0x10 | sysexComm.getChl();
-    msg[4] = offset & 0x7F;
-    
-    if ( sysexComm.isOutputActive() ) {
-        //TRACE("SENDING SYSEX: %.2X%.2X %.2X%.2X %.2X%.2X %.2X", msg[0], msg[1], msg[2], msg[3], msg[4], msg[5], msg[6]);
-        sysexComm.send(MidiMessage(msg,7));
-    }
-}
-
-void DexedAudioProcessor::unbindUI() {
-    for (int i = 0; i < ctrl.size(); i++) {
-        ctrl[i]->unbind();
-    }
 }
 
 //==============================================================================
@@ -720,7 +478,6 @@ float DexedAudioProcessor::getParameter(int index) {
 
 void DexedAudioProcessor::setParameter(int index, float newValue) {
     TRACE("setParameter index=%d newValue=%f", index, newValue);
-    forceRefreshUI = true;
     ctrl[index]->setValueHost(newValue);
 }
 
@@ -741,21 +498,13 @@ void DexedAudioProcessor::setCurrentProgram(int index) {
     }
     
     panic();
-    
+
     index = index > 31 ? 31 : index;
     currentCart.unpackProgram(data, index);
     unpackOpSwitch(0x3F);
     lfo.reset(data + 137);
     currentProgram = index;
-    triggerAsyncUpdate();
-    
-    // reset parameter display
-    DexedAudioProcessorEditor *editor = (DexedAudioProcessorEditor *) getActiveEditor();
-    if ( editor == NULL ) {
-        return;
-    }
-    editor->global.setParamMessage("");
-    
+
     panic();
 }
 
@@ -780,106 +529,4 @@ String DexedAudioProcessor::getParameterID(int index) {
     return getParameterName(index);
 }
 
-void DexedAudioProcessor::loadPreference() {
-    File propFile = DexedAudioProcessor::dexedAppDir.getChildFile("Dexed.xml");
-    PropertiesFile::Options prefOptions;
-    PropertiesFile prop(propFile, prefOptions);
-    
-    if ( ! prop.isValidFile() ) {
-        return;
-    }
-    
-    if ( prop.containsKey( String("normalizeDxVelocity") ) ) {
-        normalizeDxVelocity = prop.getIntValue( String("normalizeDxVelocity") );
-    }
-    
-    if ( prop.containsKey( String("pitchRange") ) ) {
-        controllers.values_[kControllerPitchRangeUp] = prop.getIntValue( String("pitchRange") );
-    }
-    
-    if ( prop.containsKey( String("pitchRangeDn") ) ) {
-        controllers.values_[kControllerPitchRangeDn] = prop.getIntValue( String("pitchRangeDn") );
-    } else {
-        controllers.values_[kControllerPitchRangeDn] = controllers.values_[kControllerPitchRangeUp];
-    }
-    
-    if ( prop.containsKey( String("pitchStep") ) ) {
-        controllers.values_[kControllerPitchStep] = prop.getIntValue( String("pitchStep") );
-    }
-    
-    if ( prop.containsKey( String("sysexIn") ) ) {
-        sysexComm.setInput( prop.getValue("sysexIn") );
-    }
-    
-    if ( prop.containsKey( String("sysexOut") ) ) {
-        sysexComm.setOutput( prop.getValue("sysexOut") );
-    }
-    
-    if ( prop.containsKey( String("sysexChl") ) ) {
-        sysexComm.setChl( prop.getIntValue( String("sysexChl") ) );
-    }
-    
-    if ( prop.containsKey( String("engineType") ) ) {
-        setEngineType(prop.getIntValue(String("engineType")));
-    }
-
-    if ( prop.containsKey( String("showKeyboard") ) ) {
-        showKeyboard = prop.getIntValue( String("showKeyboard") );
-    }
-
-    if ( prop.containsKey( String("wheelMod") ) ) {
-        controllers.wheel.parseConfig(prop.getValue(String("wheelMod")).toRawUTF8());
-    }
-    
-    if ( prop.containsKey( String("footMod") ) ) {
-        controllers.foot.parseConfig(prop.getValue(String("footMod")).toRawUTF8());
-    }
-    
-    if ( prop.containsKey( String("breathMod") ) ) {
-        controllers.breath.parseConfig(prop.getValue(String("breathMod")).toRawUTF8());
-    }
-    
-    if ( prop.containsKey( String("aftertouchMod") ) ) {
-        controllers.at.parseConfig(prop.getValue(String("aftertouchMod")).toRawUTF8());
-    }
-    
-    if ( prop.containsKey( String("zoomFactor") ) ) {
-        zoomFactor = prop.getDoubleValue(String("zoomFactor"));
-    }
-    
-    controllers.refresh();
-}
-
-void DexedAudioProcessor::savePreference() {
-    File propFile = DexedAudioProcessor::dexedAppDir.getChildFile("Dexed.xml");
-    PropertiesFile::Options prefOptions;
-    PropertiesFile prop(propFile, prefOptions);
-    
-    prop.setValue(String("normalizeDxVelocity"), normalizeDxVelocity);
-    prop.setValue(String("pitchRange"), controllers.values_[kControllerPitchRangeUp]); // for backwards compat
-    prop.setValue(String("pitchRangeUp"), controllers.values_[kControllerPitchRangeUp]);
-    prop.setValue(String("pitchRangeDn"), controllers.values_[kControllerPitchRangeDn]);
-    prop.setValue(String("pitchStep"), controllers.values_[kControllerPitchStep]);
-    
-    prop.setValue(String("sysexIn"), sysexComm.getInput());
-    prop.setValue(String("sysexOut"), sysexComm.getOutput());
-    prop.setValue(String("sysexChl"), sysexComm.getChl());
-    
-    prop.setValue(String("showKeyboard"), showKeyboard);
-
-    char mod_cfg[15];
-    controllers.wheel.setConfig(mod_cfg);
-    prop.setValue(String("wheelMod"), mod_cfg);
-    controllers.foot.setConfig(mod_cfg);
-    prop.setValue(String("footMod"), mod_cfg);
-    controllers.breath.setConfig(mod_cfg);
-    prop.setValue(String("breathMod"), mod_cfg);
-    controllers.at.setConfig(mod_cfg);
-    prop.setValue(String("aftertouchMod"), mod_cfg);
-    
-    prop.setValue(String("engineType"), (int) engineType);
-    prop.setValue(String("zoomFactor"), zoomFactor);
-    
-    prop.save();
-}
 

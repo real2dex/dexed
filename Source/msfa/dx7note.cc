@@ -153,11 +153,23 @@ const int32_t Dx7Note::mtsLogFreqToNoteLogFreq = (1 << 24) / log(2.);
 
 Dx7Note::Dx7Note(std::shared_ptr<TuningState> ts, MTSClient *mtsc)
 : tuning_state_(ts), mtsClient(mtsc) {
+    reset();
+}
+
+void Dx7Note::reset() {
     initialised_ = false;
     for(int op=0;op<6;op++) {
         params_[op].phase = 0;
         params_[op].gain_out = 0;
+        porta_curpitch_[op] = 0;
     }
+    // Neither the constructor nor init() ever touched the feedback buffer, so
+    // the very first samples of a feedback algorithm used to be read from
+    // whatever the heap happened to hold. Offline rendering reuses one note
+    // across clips, where that would additionally leak the previous clip's
+    // feedback tail into the next attack.
+    fb_buf_[0] = 0;
+    fb_buf_[1] = 0;
 }
 
 void Dx7Note::init(const uint8_t patch[156], int midinote, int velocity, int channel, const Controllers *ctrls) {

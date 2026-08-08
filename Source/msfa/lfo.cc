@@ -73,6 +73,7 @@ void Lfo::reset(const uint8_t params[6]) {
     }
     waveform_ = params[5];
     sync_ = params[4] != 0;
+    delaysaturated_ = false;
 }
 
 int32_t Lfo::getsample() {
@@ -106,6 +107,7 @@ int32_t Lfo::getdelay() {
     uint32_t delta = delaystate_ < (1U << 31) ? delayinc_ : delayinc2_;
     uint64_t d = ((uint64_t)delaystate_) + delta;
     if (d > ~0u) {
+        delaysaturated_ = true;
         return 1 << 24;
     }
     delaystate_ = d;

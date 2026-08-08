@@ -192,7 +192,7 @@ int DexedAudioProcessor::updateProgramFromSysex(const uint8_t *rawdata) {
     memcpy(data, rawdata, 155);
     unpackOpSwitch(0x3F);
     lfo.reset(data + 137);
-    triggerAsyncUpdate();
+
     if (sysexChecksum(rawdata, 155) != rawdata[155]) // rawdata[155] is a checksum in a sysex dump
         return 1; // just return 1 if the checksum doesn't match, might be normal if it is loaded from a cartridge
     return 0;
@@ -236,77 +236,9 @@ void DexedAudioProcessor::resetToInitVoice() {
     }
     unpackOpSwitch(0x3F);
     panic();
-    triggerAsyncUpdate();
+
 }
 
-void DexedAudioProcessor::copyToClipboard(int srcOp) {
-    DexedClipboard clipboard(data + (srcOp *21), 21);
-    clipboard.write(String("Program: '") + getProgramName(getCurrentProgram()) + "' operator: " + String(6-srcOp));
-}
-
-void DexedAudioProcessor::pasteOpFromClipboard(int destOp) {
-    DexedClipboard clipboard;
-
-    jassert(clipboard.isOperatorData());
-
-    memcpy(data+(destOp*21), clipboard.getRawData(), 21);
-    triggerAsyncUpdate();
-}
-
-void DexedAudioProcessor::pasteEnvFromClipboard(int destOp) {
-    DexedClipboard clipboard;
-
-    jassert(clipboard.isOperatorData());
-
-    memcpy(data+(destOp*21), clipboard.getRawData(), 8);
-    triggerAsyncUpdate();
-}
-
-void DexedAudioProcessor::sendCurrentSysexProgram() {
-    uint8_t raw[163];
-    
-    packOpSwitch();
-    exportSysexPgm(raw, data);
-    raw[2] = raw[2] | sysexComm.getChl();
-    if ( sysexComm.isOutputActive() ) {
-        sysexComm.send(MidiMessage(raw, 163));
-    }
-}
-
-void DexedAudioProcessor::sendCurrentSysexCartridge() {
-    uint8_t raw[4104];
-
-    currentCart.saveVoice(raw);
-    raw[2] = raw[2] | sysexComm.getChl();
-    if ( sysexComm.isOutputActive() ) {
-        sysexComm.send(MidiMessage(raw, 4104));
-    }
-}
-
-void DexedAudioProcessor::sendSysexCartridge(File cart) {
-    if ( ! sysexComm.isOutputActive() )
-        return;
-    
-    std::unique_ptr<juce::FileInputStream> fis = cart.createInputStream();
-    if ( fis == NULL ) {
-        String f = cart.getFullPathName();
-        AlertWindow::showMessageBoxAsync (AlertWindow::WarningIcon,
-                                          "Error",
-                                          "Unable to open: " + f);
-    }
-    
-    uint8 syx_data[65535];
-    int sz = fis->read(syx_data, 65535);
-    
-    if (syx_data[0] != 0xF0) {
-        String f = cart.getFullPathName();
-        AlertWindow::showMessageBoxAsync (AlertWindow::WarningIcon,
-                                          "Error",
-                                          "File: " + f + " doesn't seems to contain any sysex data");
-        return;
-    }
-    sysexComm.send(MidiMessage(syx_data, sz));
-}
 
 //==============================================================================
 void DexedAudioProcessor::getStateInformation(MemoryBlock& destData) {
@@ -490,10 +422,9 @@ void DexedAudioProcessor::setStateInformation(const void* source, int sizeInByte
         }
     }
     
-    lastStateSave = (long) time(NULL);    
+    lastStateSave = (long) time(NULL);
     TRACE("setting VST STATE");
     panic();
-    updateUI();
 }
 
 File DexedAudioProcessor::dexedAppDir;

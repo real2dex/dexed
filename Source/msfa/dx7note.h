@@ -62,6 +62,11 @@ public:
     void transferPhase(Dx7Note &src);
     void oscSync();
 
+    // Restores the just-constructed state. The offline renderer reuses one
+    // note object across clips and must not let a still-ringing voice from the
+    // previous clip change how the next one starts.
+    void reset();
+
     // We should put this as a function and not a DX7Note method
     //int32_t osc_freq(int midinote, int mode, int coarse, int fine, int detune);
 
