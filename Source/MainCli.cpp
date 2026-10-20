@@ -8,7 +8,6 @@
 #include "PluginProcessor.h"
 #include "RenderJob.h"
 
-#include <cmath>
 #include <cstdio>
 #include <iostream>
 #include <string>
@@ -259,9 +258,11 @@ JOB LINES (one JSON object per line)
             {
                 const juce::Identifier name (proc.getParameterName (i));
 
-                // Six decimals keep the JSON readable and still land on the
-                // same step: setValueHost() rounds value * steps, steps <= 99.
-                params->setProperty (name, std::round ((double) proc.getParameter (i) * 1.0e6) / 1.0e6);
+                // Passed through as the float the old JSON server's query wrote
+                // (e.g. 0.3535353541374207, not 0.353535): existing preset
+                // JSON is deduplicated by exact string match, so the digits
+                // must come out identical.
+                params->setProperty (name, proc.getParameter (i));
 
                 // Cutoff/Resonance/Output are plugin-side floats with no DX7 value.
                 if (auto* dx = dynamic_cast<CtrlDX*> (proc.ctrl[i]))
