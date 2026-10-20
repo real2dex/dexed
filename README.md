@@ -54,7 +54,16 @@ generate_jobs.py | dexed-cli batch - --threads 8
 
 # exact parameter names for the "params" field
 dexed-cli params
+
+# patch values of a cartridge as JSON lines (all 32 programs, or one)
+dexed-cli dump --syx rom1a.syx > rom1a.jsonl
+dexed-cli dump --syx rom1a.syx --program 3
 ```
+
+`dump` prints `{"program", "name", "params", "raw"}` per program. `params` is
+what the old JSON server's `{"query": "all"}` returned (normalised 0..1) and can
+be pasted into a job line unchanged; `raw` is the same patch in DX7 voice data
+units (0-99, ALGORITHM 0-31, ...).
 
 A job file is one JSON object per line:
 
@@ -86,8 +95,9 @@ build:
 * **No `Dexed.xml`.** The plugin loaded engine type, pitch bend range and
   velocity normalisation from a per-user preferences file, so its output
   depended on the machine it ran on. The CLI never reads it. In particular the
-  engine now comes from `--engine` (default `markI`); pass `--engine modern` if
-  you need to match clips a plugin build produced with `engineType=0`.
+  engine now comes from `--engine` (default `modern`, which is what a plugin
+  build with `engineType=0` used); pass `--engine markI` to match clips a plugin
+  build produced with `engineType=1`.
 * **The feedback buffer is initialised.** `Dx7Note::fb_buf_` was never cleared
   by the constructor or by `init()`, so the first ~20 ms of any patch with
   FEEDBACK > 0 was synthesised from whatever the heap happened to contain.

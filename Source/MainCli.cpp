@@ -8,6 +8,7 @@
 #include "PluginProcessor.h"
 #include "RenderJob.h"
 
+#include <cmath>
 #include <cstdio>
 #include <iostream>
 #include <string>
@@ -21,6 +22,7 @@ USAGE
   dexed-cli render [options] -o OUT.wav
   dexed-cli batch  [options] JOBS.jsonl        (use '-' to read stdin)
   dexed-cli params
+  dexed-cli dump   --syx PATH [--program N]
 
 RENDER OPTIONS
   -o, --output PATH      output wav (required)
@@ -30,12 +32,20 @@ RENDER OPTIONS
       --velocity F       0.0-1.0                            (default 0.8)
       --param NAME=VAL   normalised 0..1 override, repeatable
 
+DUMP
+  Prints the patch values of a cartridge as JSON, one line per program
+  (all 32 unless --program is given):
+  {"program": 3, "name": "BRASS 1", "params": {...}, "raw": {...}}
+  "params" holds the normalised 0..1 values the old JSON server returned for
+  {"query": "all"} and can be pasted into a job line as is. "raw" holds the
+  values as stored in the DX7 voice data (e.g. 0-99, ALGORITHM 0-31).
+
 BATCH OPTIONS
   -j, --threads N        worker threads              (default: hardware cores)
       --report           print one JSON result line per job
 
 SYNTH OPTIONS
-      --engine NAME      markI | modern | opl                (default markI)
+      --engine NAME      markI | modern | opl               (default modern)
                          The plugin picked this up from Dexed.xml; the CLI
                          never reads that file, so state it here if you need
                          to match clips rendered by the plugin build.
@@ -72,7 +82,7 @@ JOB LINES (one JSON object per line)
         juce::NamedValueSet params;
 
         RenderSpec   spec;
-        int          engineType = DEXED_ENGINE_MARKI;
+        int          engineType = DEXED_ENGINE_MODERN;
         int          threads = 0;
         bool         report  = false;
         bool         quiet   = false;
@@ -120,8 +130,8 @@ JOB LINES (one JSON object per line)
             std::exit (0);
         }
 
-        if (o.command != "render" && o.command != "batch" && o.command != "params")
-            fail ("unknown command '" + o.command + "' (expected render, batch or params)");
+        if (o.command != "render" && o.command != "batch" && o.command != "params" && o.command != "dump")
+            fail ("unknown command '" + o.command + "' (expected render, batch, params or dump)");
 
         for (int i = 1; i < args.size(); ++i)
         {
@@ -216,6 +226,57 @@ JOB LINES (one JSON object per line)
     {
         for (const auto& name : BatchRenderer::parameterNames())
             std::cout << name << "\n";
+        return 0;
+    }
+
+    int runDump (const Options& o)
+    {
+        if (o.syx == juce::File())
+            fail ("dump needs --syx");
+        if (! o.syx.existsAsFile())
+            fail ("syx not found: " + o.syx.getFullPathName());
+        if (o.program > 31)
+            fail ("--program must be 0-31");
+
+        Cartridge cart;
+        if (cart.load (o.syx) == -1)
+            fail ("syx failed to load: " + o.syx.getFullPathName());
+
+        DexedAudioProcessor proc;
+        proc.loadCartridge (cart);
+
+        const int first = o.program >= 0 ? o.program : 0;
+        const int last  = o.program >= 0 ? o.program : 31;
+
+        for (int program = first; program <= last; ++program)
+        {
+            proc.setCurrentProgram (program);
+
+            juce::DynamicObject::Ptr params = new juce::DynamicObject();
+            juce::DynamicObject::Ptr raw    = new juce::DynamicObject();
+
+            for (int i = 0; i < proc.getNumParameters(); ++i)
+            {
+                const juce::Identifier name (proc.getParameterName (i));
+
+                // Six decimals keep the JSON readable and still land on the
+                // same step: setValueHost() rounds value * steps, steps <= 99.
+                params->setProperty (name, std::round ((double) proc.getParameter (i) * 1.0e6) / 1.0e6);
+
+                // Cutoff/Resonance/Output are plugin-side floats with no DX7 value.
+                if (auto* dx = dynamic_cast<CtrlDX*> (proc.ctrl[i]))
+                    raw->setProperty (name, dx->getValue());
+            }
+
+            juce::DynamicObject::Ptr line = new juce::DynamicObject();
+            line->setProperty ("program", program);
+            line->setProperty ("name", proc.getProgramName (program).trimEnd());
+            line->setProperty ("params", juce::var (params.get()));
+            line->setProperty ("raw", juce::var (raw.get()));
+
+            std::cout << juce::JSON::toString (juce::var (line.get()), true) << "\n";
+        }
+
         return 0;
     }
 
@@ -352,6 +413,7 @@ int main (int argc, char* argv[])
     const Options o = parseArgs (args);
 
     if (o.command == "params") return runParams();
+    if (o.command == "dump")   return runDump (o);
 
     if (o.params.size() > 0)
     {
