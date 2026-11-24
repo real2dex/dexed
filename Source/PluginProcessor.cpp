@@ -65,14 +65,9 @@
 //==============================================================================
 DexedAudioProcessor::DexedAudioProcessor()
     : AudioProcessor(BusesProperties().withOutput("output", AudioChannelSet::stereo(), true)) {
-    // Exp2/Tanh/Sin fill process-global tables that do not depend on the sample
-    // rate. They are idempotent, but writing them while another thread renders
-    // would be a data race, so initSharedTables() must have run first. Calling
-    // it here as well keeps a single-instance use (tests, one-shot render)
-    // correct without any ceremony.
-    Exp2::init();
-    Tanh::init();
-    Sin::init();
+    // No lookup tables are touched here. They are process-global, and writing
+    // them while another instance renders is a data race; initSharedTables()
+    // fills them once before anything renders.
 
     synthTuningState = createStandardTuning();
     synthTuningStateLast = createStandardTuning();
@@ -124,14 +119,16 @@ DexedAudioProcessor::~DexedAudioProcessor() {
 }
 
 //==============================================================================
-// Freqlut/Lfo/PitchEnv/Env/Porta keep their tables in process-global statics
-// that are only a function of the sample rate. Rebuilding them per instance or
-// per clip is pure waste, and doing it while another worker renders is a data
-// race, so the CLI calls this exactly once up front and never again.
+// Exp2/Tanh/Sin/EngineMkI and Freqlut/Lfo/PitchEnv/Env/Porta keep their
+// tables in process-global statics (the latter only a function of the sample
+// rate). Rebuilding them per instance or per clip is pure waste, and doing it
+// while another worker renders is a data race, so the CLI calls this exactly
+// once up front, before any rendering, and never again.
 void DexedAudioProcessor::initSharedTables(double sampleRate) {
     Exp2::init();
     Tanh::init();
     Sin::init();
+    EngineMkI::initTables();
     Freqlut::init(sampleRate);
     Lfo::init(sampleRate);
     PitchEnv::init(sampleRate);

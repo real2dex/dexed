@@ -44,7 +44,9 @@ struct RenderResult
  *
  * Each worker owns a private DexedAudioProcessor, so no locking is needed on
  * the render path; the msfa lookup tables they share are read-only by then.
- * `onResult` is called from the worker threads and must be thread safe.
+ * The processors are created and destroyed on the calling thread, never
+ * concurrently. `onResult` is called from the worker threads, one call at a
+ * time.
  */
 class BatchRenderer
 {

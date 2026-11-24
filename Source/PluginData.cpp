@@ -26,6 +26,7 @@
 #include "Dexed.h"
 
 #include <fstream>
+#include <mutex>
 
 uint8_t sysexChecksum(const uint8_t *sysex, int size) {
     int sum = 0;
@@ -431,6 +432,13 @@ File DexedAudioProcessor::dexedAppDir;
 File DexedAudioProcessor::dexedCartDir;
 
 void DexedAudioProcessor::resolvAppDir() {
+    // dexedAppDir/dexedCartDir are process-wide juce::File statics and every
+    // processor calls this from its constructor. Assigning a juce::String
+    // while another thread copies or reassigns it is a use-after-free / double
+    // free, and the first-run unzip below must not run twice at once either.
+    // Resolve once; afterwards both are only ever read.
+    static std::once_flag once;
+    std::call_once(once, [] {
     #if JUCE_MAC || JUCE_IOS
         File parent = File::getSpecialLocation(File::currentExecutableFile).getParentDirectory().getParentDirectory().getParentDirectory().getSiblingFile("Dexed");
     
@@ -490,4 +498,5 @@ void DexedAudioProcessor::resolvAppDir() {
         }
         delete builtin_pgm;
     }
+    });
 }

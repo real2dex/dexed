@@ -78,6 +78,13 @@ static inline uint16_t sinLog(uint16_t phi) {
 }
 
 EngineMkI::EngineMkI() {
+    // The tables are static and shared by every instance; see initTables().
+}
+
+// Called once from DexedAudioProcessor::initSharedTables(), not from the
+// constructor, so creating a processor never writes them while another one
+// renders.
+void EngineMkI::initTables() {
     float bitReso = SINLOG_TABLESIZE;
     
     for(int i=0;i<SINLOG_TABLESIZE;i++) {

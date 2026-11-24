@@ -2,9 +2,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "RenderJob.h"
+#include "CrashHandler.h"
 #include "PluginProcessor.h"
 
 #include <atomic>
+#include <chrono>
+#include <filesystem>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -119,6 +122,40 @@ namespace
             dir.createDirectory();
     }
 
+    /**
+     * Runs `attempt` until it succeeds, for up to about half a second.
+     *
+     * On Windows a file that was just written is often held open for a moment
+     * by a scanner (Defender, the search indexer). Deleting or replacing it then
+     * fails with a sharing violation, or leaves it delete-pending so a new file
+     * of the same name cannot be created. Both clear up on their own.
+     */
+    template <typename Attempt>
+    bool retryTransient (Attempt&& attempt)
+    {
+        for (int i = 0; i < 20; ++i)
+        {
+            if (attempt())
+                return true;
+            std::this_thread::sleep_for (std::chrono::milliseconds (25));
+        }
+        return attempt();
+    }
+
+    std::filesystem::path toPath (const juce::File& file)
+    {
+       #if JUCE_WINDOWS
+        return std::filesystem::path (file.getFullPathName().toWideCharPointer());
+       #else
+        return std::filesystem::path (file.getFullPathName().toRawUTF8());
+       #endif
+    }
+
+    /**
+     * Writes to <name>.tmp next to the target and renames it into place only
+     * once it is complete, so a run that dies part way never leaves a
+     * truncated file under the real name.
+     */
     bool writeWav (const juce::File& file,
                    const juce::AudioSampleBuffer& mono,
                    const RenderSpec& spec,
@@ -126,15 +163,23 @@ namespace
     {
         ensureDirectory (file.getParentDirectory());
 
-        // FileOutputStream opens an existing file at its end, so the old
-        // contents have to go first. Measured on Windows, deleting beats
-        // opening and truncating by roughly 2x.
-        file.deleteFile();
+        const juce::File tmp = file.getSiblingFile (file.getFileName() + ".tmp");
 
-        auto stream = file.createOutputStream();
-        if (stream == nullptr)
+        // FileOutputStream opens an existing file at its end, so a leftover
+        // temp file has to go first. Measured on Windows, deleting beats
+        // opening and truncating by roughly 2x.
+        std::unique_ptr<juce::FileOutputStream> stream;
+        const bool opened = retryTransient ([&]
         {
-            error = "cannot open for writing: " + file.getFullPathName();
+            tmp.deleteFile();
+            stream = std::make_unique<juce::FileOutputStream> (tmp);
+            return stream->openedOk();
+        });
+
+        if (! opened)
+        {
+            error = "cannot open for writing: " + tmp.getFullPathName()
+                  + " (" + stream->getStatus().getErrorMessage() + ")";
             return false;
         }
 
@@ -148,6 +193,8 @@ namespace
         {
             error = "unsupported wav format: " + juce::String (spec.bitDepth) + " bit / "
                   + juce::String (spec.channels) + " ch";
+            stream.reset();
+            tmp.deleteFile();
             return false;
         }
 
@@ -169,10 +216,33 @@ namespace
             ok = writer->writeFromAudioSampleBuffer (wide, 0, numSamples);
         }
 
-        if (! ok)
-            error = "write failed: " + file.getFullPathName();
+        // Header and buffered samples out now, while the stream can still
+        // report a failure (e.g. disk full); the destructor would swallow it.
+        ok = ok && writer->flush();
+        raw->flush();
+        ok = ok && raw->getStatus().wasOk();
+        writer.reset();
 
-        return ok;
+        if (! ok)
+        {
+            error = "write failed: " + tmp.getFullPathName();
+            tmp.deleteFile();
+            return false;
+        }
+
+        // Replaces an existing file of the same name (MoveFileExW with
+        // MOVEFILE_REPLACE_EXISTING on Windows, rename(2) elsewhere).
+        std::error_code ec;
+        const auto from = toPath (tmp), to = toPath (file);
+        if (! retryTransient ([&] { std::filesystem::rename (from, to, ec); return ! ec; }))
+        {
+            error = "cannot rename " + tmp.getFullPathName() + " to " + file.getFileName()
+                  + " (error " + juce::String (ec.value()) + ")";
+            tmp.deleteFile();
+            return false;
+        }
+
+        return true;
     }
 }
 
@@ -293,6 +363,10 @@ BatchRenderer::BatchRenderer (int numThreads, double sampleRate, int blockSize, 
     // Must happen before any worker exists: these tables are process-global and
     // read-only for the rest of the run.
     DexedAudioProcessor::initSharedTables (sampleRate);
+
+    // renderOne() consults this; build it here rather than lazily on a worker,
+    // where its probe processor would be constructed mid-render.
+    parameterIndex();
 }
 
 BatchRenderer::~BatchRenderer() = default;
@@ -304,14 +378,30 @@ void BatchRenderer::run (const juce::Array<RenderJob>& jobs,
     if (total == 0)
         return;
 
+    const int workerCount = juce::jmin (numThreads, total);
+
+    // Every processor is built here, one after another, before any worker
+    // starts, and destroyed after they have all joined. Construction is not
+    // thread safe: it runs AudioProcessor's constructor and Dexed's own
+    // setup, which writes process-wide statics (the app/cartridge
+    // directories, the startup cartridge). Doing it concurrently on the
+    // workers raced on those juce::File statics.
+    std::vector<std::unique_ptr<DexedAudioProcessor>> procs;
+    procs.reserve ((size_t) workerCount);
+    for (int w = 0; w < workerCount; ++w)
+    {
+        auto proc = std::make_unique<DexedAudioProcessor>();
+        proc->setEngineType (engineType);
+        proc->prepareForOfflineRender (sampleRate, blockSize);
+        procs.push_back (std::move (proc));
+    }
+
     std::atomic<int> next { 0 };
     std::mutex resultMutex;
 
-    auto worker = [&]
+    auto worker = [&] (DexedAudioProcessor& proc)
     {
-        DexedAudioProcessor proc;
-        proc.setEngineType (engineType);
-        proc.prepareForOfflineRender (sampleRate, blockSize);
+        CrashHandler::installForThread();
 
         for (;;)
         {
@@ -319,21 +409,48 @@ void BatchRenderer::run (const juce::Array<RenderJob>& jobs,
             if (i >= total)
                 break;
 
-            RenderResult result = renderOne (proc, jobs.getReference (i), i);
+            RenderResult result;
+            result.index = i;
 
-            const std::lock_guard<std::mutex> lock (resultMutex);
-            onResult (result);
+            // A job that throws (bad_alloc, a filesystem error, ...) fails on
+            // its own instead of taking the whole batch down with terminate().
+            try
+            {
+                result = renderOne (proc, jobs.getReference (i), i);
+            }
+            catch (const std::exception& e)
+            {
+                result.ok = false;
+                result.error = juce::String ("exception: ") + e.what();
+            }
+            catch (...)
+            {
+                result.ok = false;
+                result.error = "unknown exception";
+            }
+
+            // onResult failing is fatal, but end the process from inside the
+            // catch so the crash report can still name the exception. Letting
+            // it unwind would destroy still-joinable threads (on the calling
+            // thread) and terminate without it.
+            try
+            {
+                const std::lock_guard<std::mutex> lock (resultMutex);
+                onResult (result);
+            }
+            catch (...)
+            {
+                std::terminate();
+            }
         }
     };
 
-    const int workerCount = juce::jmin (numThreads, total);
-
     std::vector<std::thread> threads;
     threads.reserve ((size_t) workerCount - 1);
-    for (int i = 1; i < workerCount; ++i)
-        threads.emplace_back (worker);
+    for (int w = 1; w < workerCount; ++w)
+        threads.emplace_back (worker, std::ref (*procs[(size_t) w]));
 
-    worker();   // the calling thread pulls its share too
+    worker (*procs[0]);   // the calling thread pulls its share too
 
     for (auto& t : threads)
         t.join();

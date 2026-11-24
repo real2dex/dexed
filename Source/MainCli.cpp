@@ -5,6 +5,7 @@
 // clip is rendered offline on a worker thread and written straight to disk.
 
 #include "../JuceLibraryCode/JuceHeader.h"
+#include "CrashHandler.h"
 #include "PluginProcessor.h"
 #include "RenderJob.h"
 
@@ -67,6 +68,15 @@ JOB LINES (one JSON object per line)
    "velocity": 0.8, "params": {"ALGORITHM": 0.5}}
   Only "output" is required; anything omitted falls back to the CLI options.
   Run 'dexed-cli params' for the exact parameter names.
+
+EXIT STATUS
+  0  every job rendered
+  1  at least one job failed (see its --report line / stderr)
+  2  bad arguments or job lines; nothing was rendered
+  anything else: the process died part way (3 = terminate/abort, 0xC0000005
+  etc. = the Windows exception code). A message and the minidump path go to
+  stderr. Only jobs that already printed a --report line are done; WAVs are
+  written to <name>.wav.tmp and renamed, so a <name>.wav is always complete.
 )";
 
     struct Options
@@ -365,6 +375,8 @@ JOB LINES (one JSON object per line)
 
         renderer.run (jobs, [&] (const RenderResult& r)
         {
+            CrashHandler::maybeCrashForTest (r.index);
+
             if (r.ok)
                 ++succeeded;
             else
@@ -401,30 +413,50 @@ JOB LINES (one JSON object per line)
     }
 }
 
+namespace
+{
+    int run (int argc, char* argv[])
+    {
+        // Brings up the JUCE runtime (and a MessageManager we never pump). No
+        // display is touched: nothing here constructs a Component.
+        juce::ScopedJuceInitialiser_GUI juceInit;
+
+        juce::StringArray args;
+        for (int i = 1; i < argc; ++i)
+            args.add (juce::String::fromUTF8 (argv[i]));
+
+        const Options o = parseArgs (args);
+
+        if (o.command == "params") return runParams();
+        if (o.command == "dump")   return runDump (o);
+
+        if (o.params.size() > 0)
+        {
+            const juce::StringArray known = BatchRenderer::parameterNames();
+            for (int i = 0; i < o.params.size(); ++i)
+                if (! known.contains (o.params.getName (i).toString()))
+                    fail ("unknown --param '" + o.params.getName (i).toString()
+                          + "' (run 'dexed-cli params' for the list)");
+        }
+
+        if (o.command == "render") return runRender (o);
+        return runBatch (o);
+    }
+}
+
 int main (int argc, char* argv[])
 {
-    // Brings up the JUCE runtime (and a MessageManager we never pump). No
-    // display is touched: nothing here constructs a Component.
-    juce::ScopedJuceInitialiser_GUI juceInit;
+    CrashHandler::install();
 
-    juce::StringArray args;
-    for (int i = 1; i < argc; ++i)
-        args.add (juce::String::fromUTF8 (argv[i]));
-
-    const Options o = parseArgs (args);
-
-    if (o.command == "params") return runParams();
-    if (o.command == "dump")   return runDump (o);
-
-    if (o.params.size() > 0)
+    try
     {
-        const juce::StringArray known = BatchRenderer::parameterNames();
-        for (int i = 0; i < o.params.size(); ++i)
-            if (! known.contains (o.params.getName (i).toString()))
-                fail ("unknown --param '" + o.params.getName (i).toString()
-                      + "' (run 'dexed-cli params' for the list)");
+        return run (argc, argv);
     }
-
-    if (o.command == "render") return runRender (o);
-    return runBatch (o);
+    catch (...)
+    {
+        // Same report as an exception escaping a worker thread. Without this
+        // MSVC treats it as a bare SEH exception 0xE06D7363 and its message
+        // is lost.
+        std::terminate();
+    }
 }

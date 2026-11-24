@@ -13,6 +13,7 @@ include_directories(../libs/MTS-ESP/Client)
 
 target_sources(${BaseTargetName} PRIVATE
         MainCli.cpp
+        CrashHandler.cpp
         RenderJob.cpp
         EngineMkI.cpp
         EngineOpl.cpp
